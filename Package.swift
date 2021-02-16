@@ -8,12 +8,13 @@ let package = Package(
     products: [
         .library(
             name: "Bugsee",
+            type: .static,
             targets: ["Bugsee"])
     ],
     targets: [
         .binaryTarget(
             name: "Bugsee",
-            url: "https://download.bugsee.com/sdk/ios/Bugsee-VERSION.zip",
-            checksum: "CHECKSUM")
+            url: "https://download.bugsee.com/sdk/ios/Bugsee-1.27.0.zip",
+            checksum: "e86eb7b211da4408cceffbc738e9e9929e2e76bb09c692d5f95ce34e3acee273")
     ]
 )
