@@ -10,7 +10,7 @@
 #   * Uncomment and paste the following script.
 #
 # --- INVOCATION SCRIPT BEGIN ---
-# SCRIPT_SRC=$(find "$PROJECT_DIR" -name 'BugseeClean' | head -1)
+# SCRIPT_SRC="${BUILD_DIR%Build/*}SourcePackages/checkouts/spm/Tools/BugseeClean"
 # if [ ! "${SCRIPT_SRC}" ]; then
 # echo "Error: BugseeClean script not found."
 # exit 1

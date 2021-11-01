@@ -10,12 +10,12 @@
 #   * Uncomment and paste the following script.
 #
 # --- INVOCATION SCRIPT BEGIN ---
-# SCRIPT_SRC=$(find "$PROJECT_DIR" -name 'BugseeAgent' | head -1)
+# SCRIPT_SRC="${BUILD_DIR%Build/*}SourcePackages/checkouts/spm/Tools/BugseeAgent"
 # if [ ! "${SCRIPT_SRC}" ]; then
-#   echo "Error: Bugsee build phase script not found. Make sure that you're including Bugsee.bundle in your project directory"
+#   echo "Error: Bugsee build phase script not found. Make sure that you're including Bugsee SPM in your project"
 #   exit 1
 # fi
-# /usr/bin/python "${SCRIPT_SRC}" <APP_TOKEN>
+# /usr/bin/python "${SCRIPT_SRC}" <APP_TOKEN> >> /tmp/BugseeAgent.txt
 # --- INVOCATION SCRIPT END ---
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
