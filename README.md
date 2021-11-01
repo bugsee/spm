@@ -7,6 +7,7 @@ Sign up for a service at [https://www.bugsee.com](https://www.bugsee.com).
 
 ## Installation
 
+**Cocoapods**
 ```bash
 pod 'Bugsee'
 ```
@@ -17,6 +18,17 @@ Run the following commands to install the Pod:
 pod install
 pod update Bugsee # This is important, install command does not guarantee you will get latest version
 ```
+
+**Swift Package Manager**
+
+Navigate to the SPM section in your project, add a new package, point it to
+
+```bash
+https://github.com/bugsee/spm
+```
+and select the latest version.
+
+**Import**
 
 Import Bugsee header file in your app delegate or the file you intend to initialize the framework from
 
