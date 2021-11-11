@@ -41,7 +41,6 @@ Import Bugsee header file in your app delegate or the file you intend to initial
 ```swift
 import Bugsee
 ```
-
 ## Initialization
 
 Locate your app delegate and initialize the framework in your *application:didFinishLaunchingWithOptions* method:
