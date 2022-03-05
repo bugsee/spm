@@ -1,6 +1,6 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
-# Copyright 2019 Bugsee, Inc. All rights reserved.
+# Copyright 2022 Bugsee, Inc. All rights reserved.
 #
 # Usage:
 #   * In the project editor, select your target.
@@ -15,7 +15,7 @@
 # echo "Error: BugseeClean script not found."
 # exit 1
 # fi
-# /usr/bin/python "${SCRIPT_SRC}"
+# python3 "${SCRIPT_SRC}"
 # --- INVOCATION SCRIPT END ---
 
 import os
@@ -34,7 +34,7 @@ def cleanBugseeFramework():
     for match_path in matches:
         os.remove(match_path)
 
-    print "Bugsee: clean success."
+    print("Bugsee: clean success.")
 
 def main():
     cleanBugseeFramework()
