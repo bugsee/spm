@@ -196,7 +196,13 @@ def uploadZipFile(zipFileLocation):
     r = requestEndPoint(version, build)
     if (r.get('ok') and r.get('endpoint')):
         print("Uploading to %s" % r.get('endpoint'))
-        return uploadBundle(r.get('endpoint'), zipFileLocation)
+        retries = 0
+        while retries < 5:
+            upload_result = uploadBundle(r.get('endpoint'), zipFileLocation)
+            if upload_result:
+                return True
+            print("Uploading to %s failed. Retrying" % r.get('endpoint'))
+            retries += 1
 
     return False
 
