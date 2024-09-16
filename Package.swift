@@ -13,7 +13,7 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "Bugsee",
-            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-5.4.0.zip",
-            checksum: "eca53b5e7ce3229b41bf1ee618044e63908a42a32e615f4415c2bd8d47b7e1fc")
+            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-5.4.1.zip",
+            checksum: "15322736cab87bd3701cc43c34a0c84c5b02cbb9e07fcf652dc8ad6bbf09675d")
     ]
 )
