@@ -16,6 +16,49 @@
 # fi
 # python3 "${SCRIPT_SRC}" <APP_TOKEN>
 # --- INVOCATION SCRIPT END ---
+#
+# Behaviors controlled by environment variables (set via Xcode's
+# "Add Environment Variable" in the scheme, or exported in a CI step
+# before invoking xcodebuild):
+#
+#   BUGSEE_SIZE_ANALYSIS_ENABLED
+#     Master switch for build/size-analysis upload. Default OFF. When
+#     unset the agent uploads dSYMs only — the legacy behavior — and
+#     no IPA is sent. Set to `1` / `true` / `yes` / `on` to opt in.
+#
+#   BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS
+#     When the master switch is on, upload the archive for every build
+#     configuration. Default OFF → only $CONFIGURATION == Release is
+#     uploaded. Set to `1` / `true` / `yes` / `on` to include Debug /
+#     custom configurations (not recommended for production dashboards
+#     since debug binaries aren't representative of shipping size).
+#
+#   BUGSEE_SIZE_ANALYSIS_DEBUG
+#     Verbose logging for the size-analysis flow — echoes the init
+#     URL (with the app token masked) and the metadata payload to
+#     `$PROJECT_TEMP_DIR/BugseeAgent.log`. Off by default.
+#
+#   BUGSEE_SIZE_CHECK_ENABLED
+#     Master switch for the in-build size-check. Default OFF. When
+#     enabled (alongside BUGSEE_SIZE_ANALYSIS_ENABLED), the agent
+#     queries the appserver for the most recent prior build's
+#     recorded artefact size and compares it to the current build.
+#     Crossing a configured threshold prints `warning:` / `error:`
+#     prefixed lines and (on FAIL) exits non-zero. Each threshold
+#     below is independently optional; a value of 0 / unset disables
+#     that gate. Negative deltas (artefact shrunk) never trigger.
+#
+#   BUGSEE_SIZE_CHECK_WARNING_PCT       e.g. 5.0 → warn at +5%
+#   BUGSEE_SIZE_CHECK_FAIL_PCT          e.g. 10.0 → fail at +10%
+#   BUGSEE_SIZE_CHECK_WARNING_BYTES     e.g. 500000 → warn at +500 KB
+#   BUGSEE_SIZE_CHECK_FAIL_BYTES        e.g. 2000000 → fail at +2 MB
+#
+#     iOS asymmetry: post-action `error:` lines surface in the
+#     daemon's log file (`$PROJECT_TEMP_DIR/BugseeAgent.log`), not
+#     the `xcodebuild` build log — Xcode does not retroactively fail
+#     an already-signed build from a post-action. CI runs that need
+#     hard gating on size growth should grep the daemon log for the
+#     `error: Bugsee size check` prefix.
 
 import os
 import subprocess
@@ -27,6 +70,11 @@ import re
 import json
 import hashlib
 import shutil
+import struct
+import uuid
+import gzip
+import socket
+import math
 from optparse import OptionParser
 import fnmatch
 
@@ -144,13 +192,13 @@ def uncrushIcon(icon, tempDir):
 
     return dest
 
-def requestEndPoint(version, build):
+def requestEndPoint(app_token, version, build):
     encoded_data = json.dumps({
         'version': version,
         'build': build
         }).encode()
 
-    req = urllib.request.Request(options.endpoint + '/apps/' + APP_TOKEN + '/symbols', data=encoded_data)
+    req = urllib.request.Request(options.endpoint + '/apps/' + app_token + '/symbols', data=encoded_data)
     req.add_header('Content-Type', 'application/json')
     response = urllib.request.urlopen(req)
 
@@ -186,14 +234,14 @@ def updateStatus(symbolId):
         return True
     return False
 
-def uploadZipFile(zipFileLocation):
+def uploadZipFile(app_token, zipFileLocation):
     if options.version or options.build:
         version = options.version
         build = options.build
     else:
         version, build = getVersionAndBuild(zipFileLocation)
 
-    r = requestEndPoint(version, build)
+    r = requestEndPoint(app_token, version, build)
     if (r.get('ok') and r.get('endpoint')):
         print("Uploading to %s" % r.get('endpoint'))
         retries = 0
@@ -206,7 +254,1523 @@ def uploadZipFile(zipFileLocation):
 
     return False
 
-def main():
+# =================================================================
+# Size-analysis upload — new in this revision
+# =================================================================
+#
+# The block below implements the iOS half of Bugsee's size-analysis
+# feature. It mirrors the Android Gradle plugin's behavior: capture
+# build-process provenance (machine / CI runner, VCS metadata,
+# Xcode + agent versions), package the `.xcarchive`'s `.app` as a
+# synthetic `.ipa`, and upload both to the worker via the
+# two-stage presigned-URL protocol the appserver exposes.
+#
+# Entirely opt-in (see BUGSEE_SIZE_ANALYSIS_ENABLED in the usage
+# comment at the top of this file). Zero effect on the existing
+# dSYM flow when disabled.
+#
+
+
+# -----------------------------------------------------------------
+# Machine / CI-runner resolver
+# -----------------------------------------------------------------
+
+def resolve_machine_label():
+    """Returns a `<provider>[:<detail>]` label describing where the
+    build ran — mirrors the cascade in Android's BuildMachineResolver
+    so the viewer can group iOS + Android builds from the same CI
+    runner. Pure env-based detection; no shelling out.
+
+    First positive provider signal wins. `None` when nothing matches
+    AND hostname lookup also fails (sandboxed / networkless hosts).
+    """
+    env = os.environ
+
+    def with_detail(prefix, detail):
+        detail = (detail or '').strip()
+        return '%s:%s' % (prefix, detail) if detail else prefix
+
+    if _env_truthy(env.get('GITHUB_ACTIONS')):
+        return with_detail('github-actions', env.get('RUNNER_NAME'))
+    if _env_truthy(env.get('GITLAB_CI')):
+        detail = (env.get('CI_RUNNER_DESCRIPTION') or '').strip() \
+                 or (env.get('CI_RUNNER_ID') or '').strip()
+        return with_detail('gitlab-ci', detail)
+    if (env.get('JENKINS_URL') or '').strip():
+        return with_detail('jenkins', env.get('NODE_NAME'))
+    if _env_truthy(env.get('CIRCLECI')):
+        return with_detail('circleci', env.get('CIRCLE_NODE_INDEX'))
+    if _env_truthy(env.get('BITRISE_IO')):
+        return with_detail('bitrise', env.get('BITRISE_APP_SLUG'))
+    if (env.get('TEAMCITY_VERSION') or '').strip():
+        agent = (env.get('AGENT_NAME') or '').strip() \
+                or (env.get('agent.name') or '').strip()
+        return with_detail('teamcity', agent)
+    # Xcode Cloud — Apple's own CI. `CI_WORKFLOW` is the canonical
+    # presence signal; `CI_XCODEBUILD_ACTION` adds action context
+    # (build / archive / test) when available.
+    if (env.get('CI_WORKFLOW') or '').strip() or _env_truthy(env.get('CI_XCODE_CLOUD')):
+        detail = (env.get('CI_WORKFLOW') or '').strip() \
+                 or (env.get('CI_XCODEBUILD_ACTION') or '').strip()
+        return with_detail('xcode-cloud', detail)
+    if _env_truthy(env.get('CI')):
+        host = (env.get('HOSTNAME') or '').strip() or _local_hostname() or ''
+        return with_detail('ci', host)
+
+    return _local_hostname()
+
+
+def _local_hostname():
+    """Short hostname or None. `socket.gethostname()` is the standard
+    cross-platform lookup; it may throw on sandboxed hosts, hence
+    the broad except."""
+    try:
+        host = socket.gethostname()
+        return host if host else None
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------
+# VCS metadata resolver
+# -----------------------------------------------------------------
+
+def resolve_vcs_metadata(working_dir):
+    """Returns a dict shaped for the upload JSON's nested `vcs`
+    sub-object. Matches what the Android Gradle plugin emits so the
+    appserver persists both identically. Keys (any / all may be
+    absent):
+
+        commit_sha, base_sha, branch, base_branch, pr_number,
+        provider, repo
+
+    The `provider` / `repo` keys drop the redundant `vcs_` prefix
+    that used to live at the top level of the upload payload —
+    inside the sub-object the prefix was noise.
+
+    Resolution order — first provider with a positive signal wins:
+      1. GitHub Actions env (push + pull_request events).
+      2. GitLab CI env (push + merge_request events).
+      3. Bitbucket Pipelines env.
+      4. Git fallback — shell out to `git` in `working_dir` when
+         none of the CI providers matched. Lets local dev archives
+         still carry `commit_sha` / `branch` without needing CI
+         context.
+    """
+    env = os.environ
+
+    # GitHub Actions ------------------------------------------------
+    if _env_truthy(env.get('GITHUB_ACTIONS')):
+        out = {'provider': 'github'}
+        _set_if_present(out, 'commit_sha', env.get('GITHUB_SHA'))
+        _set_if_present(out, 'repo',       env.get('GITHUB_REPOSITORY'))
+        if (env.get('GITHUB_EVENT_NAME') or '') == 'pull_request':
+            _set_if_present(out, 'branch',      env.get('GITHUB_HEAD_REF'))
+            _set_if_present(out, 'base_branch', env.get('GITHUB_BASE_REF'))
+            m = re.search(r'refs/pull/(\d+)/', env.get('GITHUB_REF') or '')
+            if m:
+                out['pr_number'] = int(m.group(1))
+        else:
+            branch = (env.get('GITHUB_REF') or '').replace('refs/heads/', '', 1)
+            _set_if_present(out, 'branch', branch)
+        return out
+
+    # GitLab CI -----------------------------------------------------
+    if _env_truthy(env.get('GITLAB_CI')):
+        out = {'provider': 'gitlab'}
+        _set_if_present(out, 'commit_sha', env.get('CI_COMMIT_SHA'))
+        _set_if_present(out, 'repo',       env.get('CI_PROJECT_PATH'))
+        # Merge-request pipelines expose different branch variables
+        # than push pipelines. `CI_MERGE_REQUEST_IID` is the MR
+        # number (the `_ID` variant is a global DB id and unusable
+        # as a PR reference).
+        if (env.get('CI_MERGE_REQUEST_IID') or '').strip():
+            _set_if_present(out, 'branch',      env.get('CI_MERGE_REQUEST_SOURCE_BRANCH_NAME'))
+            _set_if_present(out, 'base_branch', env.get('CI_MERGE_REQUEST_TARGET_BRANCH_NAME'))
+            try:
+                out['pr_number'] = int(env.get('CI_MERGE_REQUEST_IID'))
+            except (TypeError, ValueError):
+                pass
+        else:
+            _set_if_present(out, 'branch', env.get('CI_COMMIT_REF_NAME'))
+        return out
+
+    # Bitbucket Pipelines -------------------------------------------
+    if (env.get('BITBUCKET_BUILD_NUMBER') or '').strip():
+        out = {'provider': 'bitbucket'}
+        _set_if_present(out, 'commit_sha', env.get('BITBUCKET_COMMIT'))
+        _set_if_present(out, 'repo',       env.get('BITBUCKET_REPO_FULL_NAME') or env.get('BITBUCKET_REPO_SLUG'))
+        _set_if_present(out, 'branch',     env.get('BITBUCKET_BRANCH'))
+        if (env.get('BITBUCKET_PR_ID') or '').strip():
+            _set_if_present(out, 'base_branch', env.get('BITBUCKET_PR_DESTINATION_BRANCH'))
+            try:
+                out['pr_number'] = int(env.get('BITBUCKET_PR_ID'))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    # Git fallback --------------------------------------------------
+    # Covers local archives + any CI provider we don't specifically
+    # recognise. Missing `provider` / `repo` is fine — the server
+    # accepts partial payloads.
+    return _resolve_git_fallback(working_dir)
+
+
+def _set_if_present(out, key, value):
+    """Only write a field when its value is a non-empty string.
+    Keeps the JSON payload clean — the appserver distinguishes
+    "unknown" from "known empty" by field presence."""
+    if value and str(value).strip():
+        out[key] = str(value).strip()
+
+
+def _resolve_git_fallback(working_dir):
+    """Shell out to `git` for the basics. Returns {} if not a git
+    working tree, or if `git` isn't on PATH (rare on dev macs, but
+    possible in stripped-down CI containers)."""
+    if not working_dir or not os.path.isdir(working_dir):
+        return {}
+    out = {}
+    commit = _run_git(working_dir, ['rev-parse', 'HEAD'])
+    if commit:
+        out['commit_sha'] = commit
+    branch = _run_git(working_dir, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    # Detached HEADs show up as "HEAD" — not a meaningful branch name.
+    if branch and branch != 'HEAD':
+        out['branch'] = branch
+    return out
+
+
+def _run_git(working_dir, git_args):
+    try:
+        result = subprocess.run(
+            ['/usr/bin/env', 'git'] + list(git_args),
+            cwd=working_dir,
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        return (result.stdout or '').strip() or None
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------
+# Build info — package id, version, Xcode + agent versions
+# -----------------------------------------------------------------
+
+def resolve_bundle_info_from_app(app_path):
+    """Reads Info.plist inside a `.app` bundle via PlistBuddy. Returns
+    `(bundle_id, version, build)` — any field may be None if not
+    present (older plists occasionally lack CFBundleVersion).
+    """
+    plist = os.path.join(app_path, 'Info.plist')
+    if not os.path.isfile(plist):
+        return (None, None, None)
+    return (
+        _plist_value(plist, 'CFBundleIdentifier'),
+        _plist_value(plist, 'CFBundleShortVersionString'),
+        _plist_value(plist, 'CFBundleVersion'),
+    )
+
+
+def _plist_value(plist_path, key):
+    try:
+        result = subprocess.run(
+            ['/usr/libexec/PlistBuddy', '-c', 'Print :%s' % key, plist_path],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        return (result.stdout or '').strip() or None
+    except Exception:
+        return None
+
+
+def resolve_xcode_version():
+    """Returns the short Xcode version (e.g. `"16.2"`) or None. Tries
+    `$XCODE_VERSION_ACTUAL` first (set in every Run Script env —
+    numeric like `1620`, needs reformatting), then falls back to
+    `xcodebuild -version` which is slow but ground-truth."""
+    actual = os.environ.get('XCODE_VERSION_ACTUAL')
+    if actual and actual.isdigit():
+        # "1620" → "16.2.0" ; "1543" → "15.4.3"
+        parts = [actual[0:-2] or '0', actual[-2:-1] or '0', actual[-1:] or '0']
+        return '.'.join(p.lstrip('0') or '0' for p in parts)
+
+    try:
+        result = subprocess.run(
+            ['/usr/bin/xcodebuild', '-version'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        # First line is "Xcode X.Y".
+        first_line = (result.stdout or '').splitlines()[0].strip() if result.stdout else ''
+        m = re.match(r'^Xcode\s+(\S+)', first_line)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+# Baked-in fallback used when no sibling `version.txt` is present.
+# Kept alongside the code so the server always has a `plugin_version`
+# field to group by even on users who install from a source checkout
+# that predates the deploy pipeline writing the file.
+_BUGSEE_AGENT_FALLBACK_VERSION = 'unversioned'
+
+
+def resolve_agent_version():
+    """BugseeAgent's own version. Read from a sibling `version.txt`
+    inside the same tools.bundle when available; falls back to
+    `_BUGSEE_AGENT_FALLBACK_VERSION` so the payload always carries a
+    non-empty `plugin_version`. The server can group builds by this
+    field even when the file hasn't been written yet.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    version_file = os.path.join(here, 'version.txt')
+    try:
+        with open(version_file, 'r') as f:
+            value = (f.read() or '').strip()
+            if value:
+                return value
+    except Exception:
+        pass
+    return _BUGSEE_AGENT_FALLBACK_VERSION
+
+
+# -----------------------------------------------------------------
+# IPA packager — wrap a `.xcarchive`'s `.app` as a synthetic .ipa
+# -----------------------------------------------------------------
+
+def find_app_in_archive(archive_path):
+    """Returns the path to the `.app` bundle inside an .xcarchive.
+
+    The canonical location is `<archive>/Products/Applications/*.app`
+    — there's typically exactly one `.app` there, plus any app
+    extensions nested underneath. We return the top-level `.app`.
+    """
+    apps_dir = os.path.join(archive_path, 'Products', 'Applications')
+    if not os.path.isdir(apps_dir):
+        return None
+    for entry in sorted(os.listdir(apps_dir)):
+        candidate = os.path.join(apps_dir, entry)
+        if entry.endswith('.app') and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+# File extensions whose contents are already compressed by the
+# encoder; a second DEFLATE pass costs CPU and produces no size
+# reduction. Storing uncompressed also keeps the resulting IPA byte-
+# stable across runs that differ only in deflate-level heuristics.
+_IPA_STORE_EXTENSIONS = (
+    # Raster images with native compression.
+    '.png', '.jpg', '.jpeg', '.heic', '.heif', '.webp',
+    # PDF uses its own stream compression.
+    '.pdf',
+    # Audio / video.
+    '.mp3', '.mp4', '.mov', '.aac', '.m4a', '.m4v',
+    # Container formats we should never re-wrap.
+    '.zip', '.gz',
+    # Web fonts ship compressed.
+    '.woff', '.woff2',
+)
+
+# MS-DOS date/time epoch is 1980-01-01; picking a fixed value gives
+# the zip a stable mtime across rebuilds so two archives of identical
+# bits produce byte-identical synthetic IPAs. Mirrors the Android
+# Gradle plugin's `DOS_EPOCH_LOCAL` normalization.
+_IPA_FIXED_MTIME = (1980, 1, 1, 0, 0, 0)
+
+
+def package_app_as_ipa(app_path, output_ipa_path):
+    """Zips `<App>.app` as `Payload/<App>.app/...` into an .ipa file.
+
+    The worker's IPA analyser (`_analyze_bundle` in the worker) walks
+    `Payload/*.app` — the very structure Apple's real .ipa uses. We
+    produce the same layout minus the code-signing + iTunesMetadata
+    that only App Store Connect needs; size analysis runs off the
+    Mach-O contents and resource tree, neither of which cares about
+    signing.
+
+    DEFLATE for text/plists, STORE (no recompression) for already-
+    compressed assets. Matches real App Store IPAs byte-for-byte
+    enough that the worker's categorization heuristics behave
+    identically.
+
+    Normalisation — entry order is sorted ASCII and mtime is pinned to
+    a fixed value — so two archives of the same source tree hash
+    identically. Matters because the worker may dedup by content
+    hash on re-upload.
+    """
+    with zipfile.ZipFile(output_ipa_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(app_path):
+            # Sort in place so `os.walk` continues to traverse in
+            # deterministic order — filesystem enumeration order is
+            # otherwise non-deterministic (and differs between APFS
+            # / HFS+ / network mounts).
+            dirs.sort()
+            files.sort()
+            for f in files:
+                src = os.path.join(root, f)
+                if os.path.islink(src):
+                    # Skip symlinks — zipfile can't store them and
+                    # real IPAs don't carry them either.
+                    continue
+                rel = os.path.relpath(src, os.path.dirname(app_path))
+                # Arcname prefix puts the `.app` under `Payload/`.
+                arcname = os.path.join('Payload', rel)
+                method = (
+                    zipfile.ZIP_STORED
+                    if f.lower().endswith(_IPA_STORE_EXTENSIONS)
+                    else zipfile.ZIP_DEFLATED
+                )
+                info = zipfile.ZipInfo(filename=arcname, date_time=_IPA_FIXED_MTIME)
+                info.compress_type = method
+                # Preserve POSIX executable bits on the embedded
+                # Mach-O — otherwise the archive would encode as
+                # plain data and the worker's executable-detection
+                # heuristics (e.g. "is this the main binary?") lose
+                # a signal.
+                try:
+                    st_mode = os.stat(src).st_mode
+                    info.external_attr = (st_mode & 0xFFFF) << 16
+                except Exception:
+                    pass
+                with open(src, 'rb') as fp:
+                    zf.writestr(info, fp.read())
+    return output_ipa_path
+
+
+# -----------------------------------------------------------------
+# Two-stage upload — POST metadata → PUT presigned URL
+# -----------------------------------------------------------------
+
+def _mask_token(token):
+    """Return a log-safe rendering of the app token — first six chars
+    + ellipsis. Tokens grant write access to a project's builds; the
+    full value must never land in on-disk logs."""
+    token = token or ''
+    return (token[:6] + '…') if len(token) > 6 else '…'
+
+
+def upload_build(endpoint, app_token, ipa_path, payload, debug=False):
+    """Two-stage upload matching the Android Gradle plugin's
+    `BundleUploader.uploadData` semantics exactly:
+
+      1. `POST {endpoint}/v2/apps/{token}/builds` with a JSON body
+         describing the build (uuid, package_id, version, build,
+         build_configuration, format, commit_sha, ..., build_metadata).
+      2. Server responds with `{"endpoint": "<presigned S3 PUT URL>"}`
+         (wrapped in `{"ok": true, "result": {...}}`).
+      3. `PUT` the .ipa to the presigned URL.
+
+    A failed step is reported but never raises — the outer dispatcher
+    wraps this in try/except so a backend hiccup can't break the user's
+    archive flow. Returns True on overall success, False otherwise.
+    """
+    body = json.dumps(payload).encode('utf-8')
+    # Percent-encode the token before splicing it into the URL path —
+    # defence-in-depth against malformed config (unescaped `/` would
+    # rewrite the path, `?` would start a query). Tokens are normally
+    # hex-shaped so this is usually a no-op, but cheap insurance.
+    safe_token = urllib.parse.quote(app_token, safe='')
+    init_url = '%s/v2/apps/%s/builds' % (endpoint.rstrip('/'), safe_token)
+
+    if debug:
+        print("Bugsee: POST %s/v2/apps/%s/builds"
+              % (endpoint.rstrip('/'), _mask_token(app_token)))
+        print("Bugsee: metadata payload = %s" % json.dumps(payload))
+
+    try:
+        req = urllib.request.Request(init_url, data=body, method='POST')
+        req.add_header('Content-Type', 'application/json')
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        print("Bugsee: build create failed (HTTP %d): %s" % (e.code, err_body[:500]))
+        return False
+    except Exception as e:
+        print("Bugsee: build create network error: %s" % e)
+        return False
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        print("Bugsee: build create non-JSON response: %s" % raw[:300])
+        return False
+
+    # The appserver wraps most responses in `{"ok": true, "result": …}`.
+    # Fall back to the bare body when the `result` key isn't present
+    # (some routes return the object directly).
+    result = parsed.get('result') if isinstance(parsed, dict) else None
+    if not result and isinstance(parsed, dict):
+        result = parsed
+
+    presigned = (result or {}).get('endpoint') if isinstance(result, dict) else None
+    if not presigned:
+        print("Bugsee: build create returned no endpoint: %s" % raw[:300])
+        return False
+
+    if debug:
+        print("Bugsee: PUT artefact to presigned URL")
+
+    # Stream the .ipa from disk to the presigned URL instead of
+    # slurping the whole file into RAM — modern iOS apps can exceed
+    # 300 MB (extensions + assets), and hosted-macOS CI runners have
+    # modest memory budgets. urllib.Request accepts a file-like
+    # object for `data` as long as Content-Length is set — otherwise
+    # it falls back to chunked encoding which S3 presigned PUT
+    # signatures don't accept.
+    try:
+        ipa_size = os.path.getsize(ipa_path)
+    except OSError as e:
+        print("Bugsee: could not stat artefact for upload: %s" % e)
+        return False
+
+    try:
+        with open(ipa_path, 'rb') as fp:
+            put_req = urllib.request.Request(presigned, data=fp, method='PUT')
+            # S3 presigned PUTs require a precise Content-Length so the
+            # signed request body-length matches the signature.
+            put_req.add_header('Content-Length', str(ipa_size))
+            # Content-Type matches what a real App Store IPA would be
+            # served with; S3 stores the object without caring, the
+            # worker infers format from the zip contents.
+            put_req.add_header('Content-Type', 'application/octet-stream')
+            with urllib.request.urlopen(put_req, timeout=600) as put_resp:
+                status = put_resp.status
+    except urllib.error.HTTPError as e:
+        print("Bugsee: artefact PUT failed (HTTP %d)" % e.code)
+        return False
+    except Exception as e:
+        print("Bugsee: artefact PUT network error: %s" % e)
+        return False
+
+    if 200 <= status < 300:
+        print("Bugsee: size-analysis upload complete (HTTP %d)" % status)
+        return True
+    print("Bugsee: artefact PUT unexpected status: %d" % status)
+    return False
+
+
+# -----------------------------------------------------------------
+# In-build size-check (BUGSEE_SIZE_CHECK_*)
+# -----------------------------------------------------------------
+#
+# Synchronous companion to the size-analysis upload. After the build's
+# .ipa has been packaged we know its exact byte size; the check fetches
+# the most recent prior build's recorded size from the appserver
+# (`/v2/apps/{token}/builds/baseline`) and compares the two against
+# the user-supplied warning + fail thresholds. Crossing a fail
+# threshold prints `error: …` (Xcode's prefix for diagnostics that
+# surface in the build log + Report navigator) and exits non-zero;
+# crossing a warning prints `warning: …` and continues.
+#
+# Each gate is independently optional. A `0` value (or unset) is
+# treated as disabled — same rule the Android plugin enforces — so
+# users can pin a single gate without spelling out the others.
+#
+# iOS post-action asymmetry: when the agent is daemonized (the normal
+# Run-Script post-action path) `error:`/`warning:` lines surface in
+# the daemon's log file (`$PROJECT_TEMP_DIR/BugseeAgent.log`), not
+# the `xcodebuild` build log — Xcode does not retroactively fail an
+# already-signed build from a post-action exit code. CI scripts that
+# need to gate on size growth should grep the daemon log (or the
+# wrapping CI step's combined output, if non-daemonized) for the
+# `error: Bugsee size check` prefix.
+
+
+def _resolve_size_check_thresholds(env):
+    """Read BUGSEE_SIZE_CHECK_* env vars and normalise. Returns a dict
+    with `warning_pct` / `fail_pct` / `warning_bytes` / `fail_bytes`,
+    each set to None when the gate is disabled (unset, malformed, or
+    zero/negative). The caller treats all-None as "no active gate"
+    and skips the check entirely.
+    """
+    def parse_float(name):
+        raw = env.get(name)
+        if raw is None or raw == '':
+            return None
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        # Reject NaN AND ±Infinity along with zero/negative. NaN > 0.0
+        # is already False so it would be dropped anyway, but
+        # `float('inf') > 0.0` is True and would otherwise produce a
+        # gate that can never trigger — silently disabling the
+        # threshold the user thought they were setting.
+        if not math.isfinite(v) or v <= 0.0:
+            return None
+        return v
+
+    def parse_int(name):
+        raw = env.get(name)
+        if raw is None or raw == '':
+            return None
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    return {
+        'warning_pct':   parse_float('BUGSEE_SIZE_CHECK_WARNING_PCT'),
+        'fail_pct':      parse_float('BUGSEE_SIZE_CHECK_FAIL_PCT'),
+        'warning_bytes': parse_int('BUGSEE_SIZE_CHECK_WARNING_BYTES'),
+        'fail_bytes':    parse_int('BUGSEE_SIZE_CHECK_FAIL_BYTES'),
+    }
+
+
+def _format_bytes(n):
+    """Compact SI-ish renderer that mirrors the viewer's formatter
+    (and the Android plugin's) so one user reads a single set of
+    numbers across the whole stack."""
+    abs_n = -n if n < 0 else n
+    if abs_n < 1024:
+        return "%d B" % n
+    if abs_n < 1024 * 1024:
+        return "%.1f KB" % (n / 1024.0)
+    if abs_n < 1024 * 1024 * 1024:
+        return "%.1f MB" % (n / (1024.0 * 1024.0))
+    return "%.2f GB" % (n / (1024.0 * 1024.0 * 1024.0))
+
+
+def _format_pct(p):
+    if p == int(p):
+        return "%d%%" % int(p)
+    return "%.1f%%" % p
+
+
+def _evaluate_size_check(local_size, baseline_size, thresholds):
+    """Pure threshold evaluation. Returns (outcome, triggered_by) where
+    outcome is one of 'PASS' / 'WARN' / 'FAIL' and `triggered_by` is a
+    short label of the gate that produced the outcome (or None when
+    PASS).
+
+    Negative deltas (artifact shrunk) ALWAYS pass — the feature is a
+    growth alarm, not a stability assertion.
+
+    Fail wins over warn; percent gate is checked before bytes within
+    the same severity so the log line names the more familiar number.
+    """
+    if baseline_size <= 0:
+        return ('PASS', None, 0, 0.0)
+    delta_bytes = local_size - baseline_size
+    delta_pct = (float(delta_bytes) / float(baseline_size)) * 100.0
+    if delta_bytes <= 0:
+        return ('PASS', None, delta_bytes, delta_pct)
+
+    fp, fb = thresholds.get('fail_pct'), thresholds.get('fail_bytes')
+    wp, wb = thresholds.get('warning_pct'), thresholds.get('warning_bytes')
+    if fp is not None and delta_pct >= fp:
+        return ('FAIL', "fail threshold %s" % _format_pct(fp), delta_bytes, delta_pct)
+    if fb is not None and delta_bytes >= fb:
+        return ('FAIL', "fail threshold %s" % _format_bytes(fb), delta_bytes, delta_pct)
+    if wp is not None and delta_pct >= wp:
+        return ('WARN', "warning threshold %s" % _format_pct(wp), delta_bytes, delta_pct)
+    if wb is not None and delta_bytes >= wb:
+        return ('WARN', "warning threshold %s" % _format_bytes(wb), delta_bytes, delta_pct)
+    return ('PASS', None, delta_bytes, delta_pct)
+
+
+def _fetch_baseline(endpoint, app_token, package_id, fmt, build_configuration, debug=False):
+    """Single GET to the baseline endpoint. Returns a dict with
+    `artifact_size` / `version` / `build` on success, or None for any
+    non-success outcome (no baseline yet, network / auth / 4xx / 5xx,
+    malformed payload). The caller treats None as PASS-skip — never
+    failing the build on infra problems.
+    """
+    safe_token = urllib.parse.quote(app_token, safe='')
+    base = '%s/v2/apps/%s/builds/baseline' % (endpoint.rstrip('/'), safe_token)
+    params = [('package_id', package_id), ('format', fmt)]
+    if build_configuration:
+        params.append(('build_configuration', build_configuration))
+    url = base + '?' + urllib.parse.urlencode(params)
+
+    if debug:
+        print("Bugsee: size-check baseline lookup %s" % url)
+
+    try:
+        req = urllib.request.Request(url, method='GET')
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        print("Bugsee: size-check baseline lookup HTTP %d (%s); skipping check"
+              % (e.code, body[:200]))
+        return None
+    except Exception as e:
+        print("Bugsee: size-check baseline lookup failed (%s); skipping check" % e)
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        print("Bugsee: size-check baseline returned non-JSON; skipping (%s)" % raw[:200])
+        return None
+
+    result = parsed.get('result') if isinstance(parsed, dict) else None
+    if not result and isinstance(parsed, dict):
+        result = parsed
+    build = (result or {}).get('build') if isinstance(result, dict) else None
+    if not isinstance(build, dict):
+        # Server returned `{ build: null }` — no eligible baseline yet
+        # for this (app, package_id, format, configuration).
+        return None
+    artifact_size = build.get('artifact_size')
+    if not isinstance(artifact_size, (int, float)) or artifact_size <= 0:
+        # Legacy build without a captured artifact_size — same outcome
+        # as no baseline, skip the check rather than fall through to
+        # an older one with potentially different methodology.
+        return None
+    return {
+        'artifact_size': int(artifact_size),
+        'version': build.get('version'),
+        'build':   build.get('build'),
+    }
+
+
+def prepare_size_check(endpoint, app_token, package_id, build_configuration, debug=False):
+    """Resolve size-check config and fetch the baseline. Returns a
+    `(thresholds, baseline)` tuple, or `(None, None)` for any "skip"
+    condition (master switch off, no thresholds active, package_id
+    missing, baseline lookup failed / first build).
+
+    Split from `run_size_check` so the baseline fetch can run BEFORE
+    `upload_build`. That ordering guarantees the lookup never picks up
+    the in-flight build as its own baseline — the just-created build
+    is in `status='uploading'` (or `'processing'`) and the server's
+    baseline filter requires `status='ready'`, but worker propagation
+    is async so a fast-enough server could in principle promote our
+    build before this script's evaluate-side runs. Fetching pre-upload
+    eliminates that race entirely without depending on server timing.
+    """
+    env = os.environ
+    if not _env_truthy(env.get('BUGSEE_SIZE_CHECK_ENABLED')):
+        return (None, None)
+
+    thresholds = _resolve_size_check_thresholds(env)
+    if not any(thresholds.values()):
+        print("Bugsee: size-check enabled but no thresholds configured; skipping")
+        return (None, None)
+
+    if not package_id:
+        print("Bugsee: size-check skipped — no package_id resolved from Info.plist")
+        return (None, None)
+
+    baseline = _fetch_baseline(
+        endpoint=endpoint,
+        app_token=app_token,
+        package_id=package_id,
+        fmt='ipa',
+        build_configuration=build_configuration,
+        debug=debug,
+    )
+    if not baseline:
+        # `_fetch_baseline` already logged the cause when it was a
+        # transient failure; otherwise this is the legitimate "first
+        # build" case and we say so explicitly so users with a fresh
+        # app aren't left wondering why the check is silent.
+        print("Bugsee: size-check skipped — no baseline available")
+        return (None, None)
+
+    return (thresholds, baseline)
+
+
+def run_size_check(thresholds, baseline, local_size):
+    """Evaluate a prepared (thresholds, baseline) pair against the
+    freshly built artifact's size and emit the log line. Returns the
+    outcome string ('PASS' / 'WARN' / 'FAIL' / 'SKIP'). On FAIL
+    additionally exits the process with status 1 so the daemon log
+    closes with a non-zero exit; CI scripts grepping the log can
+    distinguish completion-with-fail from completion-with-pass.
+
+    `thresholds` and `baseline` come from `prepare_size_check`. When
+    either is `None` the function short-circuits to 'SKIP' — the
+    caller doesn't need to gate the call.
+    """
+    if thresholds is None or baseline is None:
+        return 'SKIP'
+
+    outcome, triggered_by, delta_bytes, delta_pct = _evaluate_size_check(
+        local_size, baseline['artifact_size'], thresholds,
+    )
+
+    baseline_label = ''
+    if baseline.get('version'):
+        baseline_label += "version %s" % baseline['version']
+    if baseline.get('build'):
+        baseline_label += " (%s)" % baseline['build'] if baseline_label else "(%s)" % baseline['build']
+    if not baseline_label:
+        baseline_label = "previous build"
+
+    delta_pct_signed   = ("+%s" % _format_pct(delta_pct))   if delta_bytes >= 0 else _format_pct(delta_pct)
+    delta_bytes_signed = ("+%s" % _format_bytes(delta_bytes)) if delta_bytes >= 0 else _format_bytes(delta_bytes)
+
+    summary = ("Bugsee size check: %s → %s (%s, %s) vs %s"
+               % (_format_bytes(baseline['artifact_size']),
+                  _format_bytes(local_size),
+                  delta_pct_signed,
+                  delta_bytes_signed,
+                  baseline_label))
+
+    if outcome == 'PASS':
+        print(summary)
+        return 'PASS'
+    if outcome == 'WARN':
+        # Xcode parses leading `warning:` (lowercase) into the build
+        # log + Report navigator when the line reaches a process it's
+        # monitoring. In the daemonized post-action path this surfaces
+        # only inside `BugseeAgent.log`; that's the documented iOS
+        # asymmetry — see the comment block at the top of this section.
+        print("warning: %s — exceeds %s" % (summary, triggered_by))
+        return 'WARN'
+
+    # FAIL
+    print("error: %s — exceeds %s" % (summary, triggered_by))
+    # Exit non-zero so any CI wrapper that looks at the agent's exit
+    # status (rather than grepping its log) still gets a hard signal.
+    # Inside the daemonized post-action this terminates only the
+    # daemon, not the user's archive — that's expected per the
+    # documented asymmetry.
+    sys.exit(1)
+
+
+# -----------------------------------------------------------------
+# Build-timing extraction — minimal xcactivitylog decoder
+# -----------------------------------------------------------------
+#
+# Xcode's `.xcactivitylog` files are gzipped SLF-format streams
+# living in `<DerivedData>/<Project>/Logs/Build/`. The full schema is
+# large and Xcode-version-sensitive — Spotify's XCLogParser is the
+# authoritative reference. This decoder stays deliberately narrow:
+# it extracts only the ROOT section's start/end timestamps so we can
+# report `total_ms`. Per-category breakdown + top-N slowest tasks
+# are deferred to a follow-up change that vendors a proper SLF
+# grammar; shipping just `total_ms` gives meaningful signal with
+# much lower parsing risk.
+#
+# When any step fails the function returns None and the caller simply
+# omits the `timings` field — size-analysis payloads without timings
+# are a first-class "known incomplete" shape on the server side.
+
+
+# CFAbsoluteTime epoch is 2001-01-01 UTC; Unix epoch is 1970-01-01.
+# Converting between them matters for any log-line we might print but
+# NOT for the duration calculation (differences cancel).
+_CF_ABSOLUTE_TIME_EPOCH_OFFSET = 978307200
+
+# Upper bound on how many bytes of decompressed log we're willing to
+# scan for the per-section timing extraction. Most build logs are
+# under 2 MB decompressed; 20 MB is paranoid-safe and keeps CPU /
+# memory in check even on exotically large monorepo builds.
+_XCACTIVITYLOG_MAX_DECOMPRESSED = 20 * 1024 * 1024
+
+# Cap for the `top_tasks` list sent in `build_metadata.timings` — the
+# server sanitizer caps at 50, plugin default is 10 to match Android.
+_XCACTIVITYLOG_TOP_N = 10
+
+# Timestamps in the SLF stream are written as little-endian IEEE-754
+# doubles, hex-encoded (16 lowercase hex characters, no separator).
+# Section boundaries always place `startTime` and `endTime` adjacent
+# and separated only by a nil (`^`) marker. Matching that compound
+# shape in one regex avoids false positives from hex runs that appear
+# inside titles / JSON payloads / UUIDs.
+_SLF_SECTION_TIMESTAMPS_RE = re.compile(
+    rb'(?<![0-9a-f])([0-9a-f]{16})\^([0-9a-f]{16})\^'
+)
+
+# Title prefixes we exclude from the `top_tasks` list AND from
+# per-category sums because they're container / wrapper sections
+# whose duration is the sum of their children — keeping them would
+# make the top-10 look like "Build X 18s, Build target X 18s, …",
+# crowding out the actual slow work, and would massively inflate
+# any category they land in.
+# Scoped to specific known wrappers so that genuinely-slow leaf
+# tasks whose titles merely happen to start with a common verb
+# ("Compile asset catalogs" is an opaque leaf, for example) still
+# surface.
+_XCACTIVITYLOG_WRAPPER_PREFIXES = (
+    'Build ',           # "Build <target>" — whole-target wrapper
+    'Build target ',    # "Build target <name>" — inner wrapper
+    'Compiling ',       # "Compiling X.swift[, Y.swift]" — groups per-arch compiles
+    'Prepare ',         # build-system preparation wrappers
+    'Create build ',    # XCBuild wrappers
+    'Send project ',    # XCBuild wrapper (project description)
+    'Clean ',           # "Clean <target>" — clean wrapper
+    'Workspace ',       # workspace-level wrapper
+    'SchemeAction ',    # pre/post-action wrappers
+    'Run pre-actions',
+    'Run post-actions',
+)
+
+
+# Per-category title classifier for iOS build events. Wire shape is
+# the same as the Android Gradle plugin's (`managed_code_ms` /
+# `native_ms` / `resources_ms` / `packaging_ms` / `other_ms`) so
+# appserver + viewer render both platforms from a single schema.
+# Semantic mapping for iOS:
+#
+#   managed_code_ms → never emitted on iOS. Reserved for JVM-
+#                     bytecode pipelines (kotlinc / javac / R8 /
+#                     desugar) on Android. Everything iOS compiles
+#                     is native code — Swift, Obj-C, C and C++ all
+#                     flow through clang/swiftc into the Mach-O.
+#   native_ms       → Swift + Obj-C + C/C++ compile units, Swift
+#                     module planning / emission / clang module
+#                     building. Dominates almost every iOS build.
+#                     Matches the Android semantic (JNI/C++ compile
+#                     via CMake / NDK lands in `native_ms` there).
+#   resources_ms    → asset catalogs, storyboards, xibs, strings,
+#                     plist processing, resource copies.
+#   packaging_ms    → linking, code signing, framework embedding,
+#                     strip, touch, dSYM generation, Swift stdlib
+#                     embedding (conceptually "get the runtime into
+#                     the bundle").
+#   other_ms        → build-graph dependency computation, tool
+#                     version discovery, auxiliary file generation,
+#                     Swift Package Manager resolution steps — the
+#                     scaffolding that isn't otherwise classified.
+#                     Typically <1% on a simple app build; SPM-heavy
+#                     projects can push this higher as `Computing
+#                     package information` / `Copying Package.resolved`
+#                     / `Resolve Package Graph` all land in this
+#                     bucket.
+#
+# Wrapper prefixes filter FIRST so container sections contribute to
+# no category; within the remaining rules, precedence is native →
+# resources → packaging (each list is checked in order and the
+# first match wins).
+_XCACTIVITYLOG_CATEGORY_NATIVE_PATTERNS = (
+    # Per-source compile events: "Compile Foo.swift (arm64)", etc.
+    re.compile(r'^Compile \S+\.(swift|m|mm|c|cpp|cxx|cc)\b', re.IGNORECASE),
+    re.compile(r'^CompileSwiftSources\b'),
+    re.compile(r'^CompileC\b'),
+    re.compile(r'^CompileSwift\b'),
+    # Swift toolchain phases — planning / driver / module emission.
+    re.compile(r'^Planning Swift module\b'),
+    re.compile(r'^SwiftDriver\b'),
+    re.compile(r'^Emit(?:ting)? [Ss]wift [Mm]odule\b'),
+    re.compile(r'^Emitting module for\b'),
+    re.compile(r'^SwiftMergeGeneratedHeaders\b'),
+    re.compile(r'^SwiftVerifyEmittedModuleInterface\b'),
+    re.compile(r'^Generate Swift Constant Values\b'),
+    # Explicit module / Clang module builds pulled into Swift.
+    re.compile(r'^Compiling Clang module\b'),
+    re.compile(r'^Precompile module\b'),
+    re.compile(r'^Explicitly Built\b'),
+    re.compile(r'^Discovering version info for swiftc\b'),
+    re.compile(r'^Extract app intents metadata\b', re.IGNORECASE),
+)
+_XCACTIVITYLOG_CATEGORY_RESOURCES_PATTERNS = (
+    re.compile(r'^Compile asset catalog', re.IGNORECASE),
+    re.compile(r'^CompileAssetCatalog\b'),
+    re.compile(r'^CompileStoryboard\b'),
+    re.compile(r'^CompileXIB\b'),
+    re.compile(r'^CompileXCStrings\b'),
+    # `LinkStoryboards` must be caught here, before the packaging
+    # tuple's generic `^Link\b` rule claims it. The native →
+    # resources → packaging precedence in `_classify_section_title`
+    # is what keeps this working — do not reorder.
+    re.compile(r'^LinkStoryboards\b'),
+    re.compile(r'^CompileStrings\b'),
+    re.compile(r'^ProcessInfoPlistFile\b'),
+    re.compile(r'^CpResource\b'),
+    re.compile(r'^CopyPlistFile\b'),
+    re.compile(r'^CopyStringsFile\b'),
+    re.compile(r'^CopyTiffFile\b'),
+    re.compile(r'^CopyPNGFile\b'),
+    re.compile(r'^GenerateAssetSymbols\b'),
+)
+_XCACTIVITYLOG_CATEGORY_PACKAGING_PATTERNS = (
+    re.compile(r'^Link\b'),
+    re.compile(r'^Ld\b'),
+    re.compile(r'^CodeSign\b'),
+    re.compile(r'^Sign \b'),
+    re.compile(r'^SignManifestFile\b'),
+    re.compile(r'^Strip\b'),
+    re.compile(r'^Touch\b'),
+    re.compile(r'^Embed\b'),
+    re.compile(r'^ProcessProductPackaging\b'),
+    re.compile(r'^RegisterExecutionPolicyException\b'),
+    re.compile(r'^Validate\b'),
+    re.compile(r'^GenerateDSYMFile\b'),
+    re.compile(r'^CreateUniversalBinary\b'),
+    # Swift stdlib embedding — `swift-stdlib-tool` copies the Swift
+    # runtime dylibs into the app bundle. Conceptually packaging,
+    # not compilation.
+    re.compile(r'^Copy Swift standard libraries\b'),
+)
+
+
+def _find_derived_data_root(obj_root):
+    """Walk up from `$OBJROOT` looking for the first ancestor that has
+    a `Logs/Build/` subdirectory — that's Xcode's per-project
+    DerivedData root. Returns the path, or None when not found.
+
+    `$OBJROOT` during `archive` typically resolves to
+    `<DerivedData>/Build/Intermediates.noindex/ArchiveIntermediates/
+    <SchemeName>/IntermediateBuildFilesPath`, so the ancestor walk
+    usually crosses four or five directory levels before hitting the
+    logs folder. Bounded by an explicit step cap so a malformed
+    `$OBJROOT` never sends us walking to `/`.
+    """
+    if not obj_root:
+        return None
+    current = os.path.normpath(obj_root)
+    for _ in range(10):
+        candidate = os.path.join(current, 'Logs', 'Build')
+        if os.path.isdir(candidate):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    return None
+
+
+def _find_latest_xcactivitylog(obj_root):
+    """Return the path to the newest `.xcactivitylog` Xcode wrote for
+    this project, or None if the log directory can't be located.
+
+    "Newest" is resolved by mtime — Xcode writes one log file per
+    build/archive, so the most-recently-modified one in `Logs/Build/`
+    corresponds to the archive we're currently running under.
+    """
+    dd_root = _find_derived_data_root(obj_root)
+    if not dd_root:
+        return None
+    log_dir = os.path.join(dd_root, 'Logs', 'Build')
+    try:
+        entries = [
+            os.path.join(log_dir, f)
+            for f in os.listdir(log_dir)
+            if f.endswith('.xcactivitylog')
+        ]
+    except OSError:
+        return None
+    if not entries:
+        return None
+    # Tie-break by filename so sibling logs with the same
+    # second-granularity mtime (HFS+ filesystems, rsync-preserving-
+    # mtime CI caches) don't shuffle non-deterministically. Xcode
+    # encodes a monotonic timestamp at the start of each log's
+    # UUID-based filename, so descending-by-name pairs well with
+    # descending-by-mtime.
+    entries.sort(
+        key=lambda p: (os.path.getmtime(p), os.path.basename(p)),
+        reverse=True,
+    )
+    return entries[0]
+
+
+def _parse_hex_double(hex_bytes):
+    """Decode a 16-char lowercase-hex representation of a little-endian
+    IEEE-754 double back to its float value. Returns None on malformed
+    input so callers can filter garbage silently."""
+    try:
+        return struct.unpack('<d', bytes.fromhex(hex_bytes.decode('ascii')))[0]
+    except Exception:
+        return None
+
+
+def _walk_back_to_title(data, end_pos):
+    """Given the position of a section's `<startHex>^<endHex>^`
+    timestamp block, walk the bytes backward to find the section's
+    title string.
+
+    SLF serialises sections as `<titleLen>"<title><detailLen>"<detail>
+    <startHex>^<endHex>^...`. We first find the nearest `"` before
+    `end_pos` (that's the opening of `titleDetail`), then rewind past
+    titleDetail to find the earlier `"` that opens `title`. When
+    that second walk-back fails (the section only has a title — no
+    distinct detail), we fall back to whatever single string we did
+    find.
+
+    Returns the decoded title string, or None when no sensible
+    length-prefixed string is discernible.
+    """
+    # Step 1 — find titleDetail's containing `"` (or title's if the
+    # section has only one string field).
+    cursor = end_pos - 1
+    max_back = 2000
+    while cursor >= 0 and data[cursor:cursor + 1] != b'"':
+        cursor -= 1
+        if end_pos - cursor > max_back:
+            return None
+    if cursor < 0:
+        return None
+
+    length_end = cursor
+    length_start = length_end
+    # Explicit ASCII-digit byte check — `chr(byte).isdigit()` also
+    # accepts non-ASCII Unicode digits (Arabic-Indic `٠–٩`, superscripts
+    # like `²`), which on stray high-byte runs would over-consume into
+    # binary territory and only fail much later at `int()` parsing.
+    while length_start > 0 and 0x30 <= data[length_start - 1] <= 0x39:
+        length_start -= 1
+    if length_start == length_end:
+        return None
+    try:
+        stated_len = int(data[length_start:length_end])
+    except ValueError:
+        return None
+    content_start = cursor + 1
+    content_end = content_start + stated_len
+    if content_end > end_pos:
+        return None
+    title_detail = data[content_start:content_end].decode('utf-8', errors='replace')
+
+    # Step 2 — rewind past titleDetail's own length prefix to look
+    # for the earlier title string. The title, if present, ends
+    # exactly where titleDetail's length prefix begins.
+    cursor2 = length_start - 1
+    while cursor2 >= 0 and data[cursor2:cursor2 + 1] != b'"':
+        cursor2 -= 1
+        if length_start - cursor2 > max_back:
+            return title_detail
+    if cursor2 < 0:
+        return title_detail
+
+    length_end2 = cursor2
+    length_start2 = length_end2
+    while length_start2 > 0 and 0x30 <= data[length_start2 - 1] <= 0x39:
+        length_start2 -= 1
+    if length_start2 == length_end2:
+        return title_detail
+    try:
+        stated_len2 = int(data[length_start2:length_end2])
+    except ValueError:
+        return title_detail
+
+    cs2 = cursor2 + 1
+    ce2 = cs2 + stated_len2
+    # Only accept the outer title when its stated length lands us
+    # exactly at titleDetail's length-prefix start — otherwise we'd
+    # be reading unrelated earlier bytes as a title.
+    if ce2 != length_start:
+        return title_detail
+    return data[cs2:ce2].decode('utf-8', errors='replace')
+
+
+def _is_wrapper_title(title):
+    """True when a section title is a known container / parent wrapper
+    whose duration double-counts its children. Filtered out of
+    `top_tasks` AND per-category sums so aggregates reflect real
+    work rather than the enclosing build-target envelope."""
+    if not title:
+        return True
+    for prefix in _XCACTIVITYLOG_WRAPPER_PREFIXES:
+        if title.startswith(prefix):
+            return True
+    return False
+
+
+def _classify_section_title(title):
+    """Map an xcactivitylog section title to one of the cross-platform
+    category buckets: `'native'`, `'resources'`, `'packaging'`,
+    `'other'`. (iOS never emits `'managed_code'` — see the mapping
+    docstring above the pattern tuples.) Returns `None` for wrapper
+    titles so callers know to skip the section entirely. Precedence-
+    ordered regex scan — first match wins.
+
+    Pattern-based rather than tree-based, so parallel task durations
+    can sum to more than wall-clock `total_ms`. That's expected on
+    real iOS builds (asset catalogs run in parallel with Swift
+    compiles). Downstream renderers (the viewer) use `max(total, sum)`
+    as the percent denominator to render a meaningful stacked bar
+    in that case — see elements-build-metadata.component.ts.
+    """
+    if not title or _is_wrapper_title(title):
+        return None
+    for p in _XCACTIVITYLOG_CATEGORY_NATIVE_PATTERNS:
+        if p.match(title):
+            return 'native'
+    for p in _XCACTIVITYLOG_CATEGORY_RESOURCES_PATTERNS:
+        if p.match(title):
+            return 'resources'
+    for p in _XCACTIVITYLOG_CATEGORY_PACKAGING_PATTERNS:
+        if p.match(title):
+            return 'packaging'
+    return 'other'
+
+
+def _parse_xcactivitylog(log_path):
+    """Extract the build's wall-clock duration AND a top-N slowest-
+    sections list from an `.xcactivitylog`.
+
+    Returns a dict with:
+      - `total_ms`: root section wall-clock, or None if not found.
+      - `top_tasks`: up to `_XCACTIVITYLOG_TOP_N` entries of the form
+        `{"name": <title>, "duration_ms": <int>}`, non-wrapper
+        sections ordered by duration descending.
+
+    When the log can't be opened / decompressed / parsed at all, the
+    whole function returns None and the caller simply omits the
+    `timings` field.
+    """
+    try:
+        with gzip.open(log_path, 'rb') as g:
+            data = g.read(_XCACTIVITYLOG_MAX_DECOMPRESSED + 1)
+    except Exception:
+        return None
+
+    if len(data) > _XCACTIVITYLOG_MAX_DECOMPRESSED:
+        # Truncated to cap memory; timings from a truncated tail
+        # would be missing anyway. Work with what we have — the root
+        # section always lives at the head of the stream.
+        data = data[:_XCACTIVITYLOG_MAX_DECOMPRESSED]
+
+    # Collect every `<startHex>^<endHex>^` timestamp pair we see and
+    # associate each with its preceding title. The FIRST pair that
+    # passes all plausibility filters is the root section's
+    # timestamps — that's our `total_ms`. Using "first valid match"
+    # rather than "first regex match at idx 0" matters: if the very
+    # first regex hit fails a filter (implausible stamp, nonsense
+    # duration), we'd otherwise lose the root.
+    sections = []
+    root_duration_ms = None
+    for m in _SLF_SECTION_TIMESTAMPS_RE.finditer(data):
+        start_t = _parse_hex_double(m.group(1))
+        end_t = _parse_hex_double(m.group(2))
+        if start_t is None or end_t is None:
+            continue
+        # CFAbsoluteTime is seconds since 2001; a timestamp under
+        # ~1e8 would predate 2004 and is almost certainly a coincidence
+        # (some random hex sequence that happened to parse). Reject
+        # implausible stamps to keep top-N focused on real build events.
+        if start_t < 1e8 or end_t < start_t:
+            continue
+        duration_ms = int(round((end_t - start_t) * 1000))
+        # 24 hours is more than anyone's Xcode build, and guards
+        # against NaN-ish arithmetic producing an absurd duration.
+        if duration_ms < 0 or duration_ms > 24 * 60 * 60 * 1000:
+            continue
+
+        title = _walk_back_to_title(data, m.start())
+        sections.append((title, duration_ms))
+        if root_duration_ms is None:
+            root_duration_ms = duration_ms
+
+    if not sections:
+        return None
+
+    # Non-wrapper sections, longest first, capped at TOP_N.
+    leaf_sorted = sorted(
+        ((title, dur) for title, dur in sections if not _is_wrapper_title(title)),
+        key=lambda td: td[1],
+        reverse=True,
+    )
+    # Title length clamp mirrors the server sanitizer's MAX_TASK_NAME_LEN
+    # (255 chars). Concatenated Swift-compile group titles occasionally
+    # get very long ("Compiling A.swift, B.swift, C.swift, …"); clamping
+    # at the source keeps the JSON tidy and rejects nothing the server
+    # would silently truncate anyway.
+    top_tasks = [
+        {'name': title[:255], 'duration_ms': dur}
+        for title, dur in leaf_sorted[:_XCACTIVITYLOG_TOP_N]
+        if dur >= 1  # sub-millisecond entries are noise on any real build
+    ]
+
+    # Per-category sums. Wrapper sections are filtered inside
+    # `_classify_section_title`, so the Build / Build-target envelopes
+    # don't land in any bucket. Category sums on a parallel build can
+    # exceed wall-clock `total_ms` — the viewer renders that correctly
+    # via a `max(total, sum)` denominator (see
+    # elements-build-metadata.component.ts).
+    # `managed_code` is a cross-platform bucket that iOS never fills
+    # (Swift / Obj-C / C/C++ all land in `native`), but we keep it
+    # pre-seeded to zero for parity with the Android side — the
+    # emission loop filters out zero-valued buckets so the wire
+    # payload remains tidy.
+    category_sums = {
+        'managed_code': 0,
+        'native': 0,
+        'resources': 0,
+        'packaging': 0,
+        'other': 0,
+    }
+    for title, duration_ms in sections:
+        bucket = _classify_section_title(title)
+        if bucket is None:
+            continue
+        category_sums[bucket] += duration_ms
+
+    return {
+        'total_ms': root_duration_ms,
+        'top_tasks': top_tasks,
+        'category_sums': category_sums,
+    }
+
+
+def resolve_build_timings(env):
+    """Produce the `build_metadata.timings` sub-object for the current
+    build, or None when no timing source is available.
+
+    Populates `total_ms` from the root `.xcactivitylog` section, a
+    `top_tasks` list of the slowest non-wrapper sections, and a
+    per-category rollup (`native_ms` / `resources_ms` /
+    `packaging_ms` / `other_ms`) classified by section title. iOS
+    never emits `managed_code_ms` — Swift / Obj-C / C / C++ all
+    compile into the Mach-O and land in `native_ms` on this
+    platform. The server schema shares the field names with Android,
+    which keeps `managed_code_ms` populated (JVM-bytecode
+    compilation: kotlinc / javac / R8 / desugar).
+    """
+    obj_root = env.get('OBJROOT')
+    log_path = _find_latest_xcactivitylog(obj_root)
+    if not log_path:
+        return None
+    parsed = _parse_xcactivitylog(log_path)
+    if not parsed:
+        return None
+
+    # Server sanitizer drops fields that are falsy / None, but being
+    # explicit about omissions keeps the wire payload tidy. Emit
+    # zero-valued category sums as positive zeros so "no data" stays
+    # distinguishable from "genuinely zero time in this category" on
+    # the server — the sanitizer preserves zero-valued ints.
+    timings = {}
+    if parsed.get('total_ms'):
+        timings['total_ms'] = parsed['total_ms']
+    if parsed.get('top_tasks'):
+        timings['top_tasks'] = parsed['top_tasks']
+    for bucket, value in (parsed.get('category_sums') or {}).items():
+        if value > 0:
+            timings['%s_ms' % bucket] = value
+    return timings or None
+
+
+# -----------------------------------------------------------------
+# Size-analysis flow + gate
+# -----------------------------------------------------------------
+
+def should_run_size_analysis_flow():
+    """Gate for the new size-analysis upload. Defaults to OFF — users
+    must explicitly opt in via BUGSEE_SIZE_ANALYSIS_ENABLED. When on,
+    restricted to Release configurations unless
+    BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS is also set.
+
+    Requires `$ACTION == install` (= Xcode's Archive action) so the
+    `.xcarchive` is available at `$ARCHIVE_PATH`. Scheme post-actions
+    on Build don't carry an archive.
+    """
+    env = os.environ
+    if not _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ENABLED')):
+        return False
+
+    action = (env.get('ACTION') or '').strip()
+    if action != 'install':
+        print("Bugsee: size-analysis upload requires an Archive action "
+              "(got ACTION=%r). Skipping." % action)
+        return False
+
+    archive_path = (env.get('ARCHIVE_PATH') or '').strip()
+    if not archive_path or not os.path.isdir(archive_path):
+        print("Bugsee: size-analysis upload could not locate the .xcarchive "
+              "(ARCHIVE_PATH=%r). Skipping." % archive_path)
+        return False
+
+    config = (env.get('CONFIGURATION') or '').strip()
+    if config != 'Release' and not _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS')):
+        print("Bugsee: size-analysis upload skipped for configuration %r "
+              "(set BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS=1 to include "
+              "non-Release configurations)." % config)
+        return False
+
+    return True
+
+
+def run_size_analysis_flow(app_token):
+    """Archive → synthetic IPA → upload. Runs inside the detached
+    daemon so archive wall-clock is untouched."""
+    env = os.environ
+    archive_path = env['ARCHIVE_PATH']
+    endpoint = options.endpoint
+
+    app_path = find_app_in_archive(archive_path)
+    if not app_path:
+        print("Bugsee: no .app found inside %s/Products/Applications/. "
+              "Skipping size-analysis upload." % archive_path)
+        return
+
+    bundle_id, version, build_number = resolve_bundle_info_from_app(app_path)
+
+    temp_dir = tempfile.mkdtemp(prefix='bugsee-size-')
+    try:
+        # Sanitise the filename stem. `bundle_id` comes from
+        # Info.plist via PlistBuddy and is normally reverse-DNS
+        # (`com.example.app`), but a malformed plist could smuggle
+        # path-traversal characters. `os.path.basename` discards any
+        # directory component, then a whitelist strip for good
+        # measure keeps the filename entirely inside `temp_dir`.
+        stem = bundle_id or os.path.basename(app_path)[:-4]
+        safe_stem = re.sub(r'[^A-Za-z0-9._-]', '_', os.path.basename(stem))
+        ipa_path = os.path.join(temp_dir, '%s.ipa' % (safe_stem or 'build'))
+        print("Bugsee: packaging %s → %s" % (os.path.basename(app_path), ipa_path))
+        package_app_as_ipa(app_path, ipa_path)
+
+        # Capture the .ipa byte size up-front. Sent in the upload
+        # payload so the server stores it as the build's
+        # `artifact_size` — that's the value the next build's size-
+        # check will retrieve via `/builds/baseline` for delta math.
+        # Same units cross-platform: file size of the artefact that
+        # was uploaded (AAB/APK on Android, IPA here).
+        try:
+            artifact_size = os.path.getsize(ipa_path)
+        except OSError:
+            artifact_size = 0
+
+        # Resolve all provenance fields. None of these should raise —
+        # resolvers return None / {} on failure to keep the upload
+        # payload best-effort.
+        vcs = resolve_vcs_metadata(env.get('SRCROOT') or os.getcwd())
+        machine = resolve_machine_label()
+        xcode_version = resolve_xcode_version()
+        agent_version = resolve_agent_version()
+
+        # Assemble the Android-compatible payload shape so the
+        # appserver persists both platforms identically. `uuid` is
+        # random per script invocation — matches Android's
+        # `UUID.randomUUID()` per Gradle build. Re-uploading the
+        # same archive would produce a new build record; that's
+        # consistent with Android behavior.
+        payload = {
+            'uuid': str(uuid.uuid4()),
+            'format': 'ipa',
+        }
+        if bundle_id:
+            payload['package_id'] = bundle_id
+        if version:
+            payload['version'] = version
+        if build_number:
+            payload['build'] = build_number
+        if artifact_size > 0:
+            payload['artifact_size'] = artifact_size
+        config = (env.get('CONFIGURATION') or '').strip()
+        if config:
+            payload['build_configuration'] = config
+        # VCS block — nested under `vcs` to match the appserver's
+        # `VcsMetadataSchema`. Omitted entirely when the resolver
+        # produced no fields (local dev machine, no CI context, no
+        # git info) so the server distinguishes "unknown" cleanly.
+        if vcs:
+            payload['vcs'] = vcs
+
+        # `build_metadata` sub-object. Field semantics mirror the
+        # Android Gradle plugin's — `plugin_version` is this agent's
+        # version; `build_system_version` is the host build system
+        # (Xcode for iOS, Gradle for Android); `build_sdk_version`
+        # identifies the SDK the artefact was built against so the
+        # server can distinguish an "iOS 18 SDK" build from an iOS 17
+        # one. `$SDK_NAME` is a standard Run-Script env var populated
+        # by Xcode during archive; typical values are
+        # `iphoneos18.5` / `iphonesimulator17.0` / `macosx14.0`.
+        metadata = {}
+        if machine:
+            metadata['machine'] = machine
+        if agent_version:
+            metadata['plugin_version'] = agent_version
+        if xcode_version:
+            metadata['build_system_version'] = xcode_version
+        sdk_name = (env.get('SDK_NAME') or '').strip()
+        if sdk_name:
+            metadata['build_sdk_version'] = sdk_name
+        timings = resolve_build_timings(env)
+        if timings:
+            metadata['timings'] = timings
+        if metadata:
+            payload['build_metadata'] = metadata
+
+        debug = _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_DEBUG'))
+
+        # Size-check preparation runs BEFORE `upload_build` so the
+        # baseline lookup naturally excludes the build we are about
+        # to create — there's nothing on the server with our `uuid`
+        # at this moment. Doing it after the upload would create a
+        # narrow race window where a fast worker could promote our
+        # build to `status='ready'` before the lookup runs, returning
+        # the new build as its own baseline (`delta == 0`, false PASS).
+        # `prepare_size_check` returns `(None, None)` for every "skip"
+        # condition; the evaluate-side handles those uniformly.
+        sc_thresholds, sc_baseline = prepare_size_check(
+            endpoint=endpoint,
+            app_token=app_token,
+            package_id=bundle_id,
+            build_configuration=config,
+            debug=debug,
+        )
+
+        upload_build(endpoint, app_token, ipa_path, payload, debug=debug)
+
+        # In-build size-check evaluation. Runs regardless of upload
+        # outcome — the check only needs the local size + the
+        # baseline fetched above, so a failed upload doesn't prevent
+        # the user from learning their artefact grew. On FAIL the
+        # function terminates the daemon with `sys.exit(1)`.
+        if artifact_size > 0:
+            run_size_check(sc_thresholds, sc_baseline, artifact_size)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# -----------------------------------------------------------------
+# Flow dispatch helpers
+# -----------------------------------------------------------------
+
+def _env_truthy(value):
+    """True when an env-var-style value is a conventional "on" token.
+
+    Matches the set used by the Android Gradle plugin (`"1"`, `"true"`,
+    `"yes"`, `"on"`, case-insensitive) so a single CI config snippet
+    can enable the feature on both platforms.
+    """
+    return (value or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def should_run_dsym_flow():
+    """Preflight for the legacy dSYM upload path.
+
+    Previously these checks lived in the pre-main double-fork block
+    and `exit(0)`d the whole daemon on failure, which killed the
+    size-analysis flow too. They're now scoped to the dSYM flow only.
+    """
+    if os.environ.get('DEBUG_INFORMATION_FORMAT') != 'dwarf-with-dsym':
+        print("Bugsee: DEBUG_INFORMATION_FORMAT is not 'dwarf-with-dsym'. Skipping dSYM upload. See: https://docs.bugsee.com/sdk/ios/symbolication/")
+        return False
+    if os.environ.get('EFFECTIVE_PLATFORM_NAME') == '-iphonesimulator':
+        print("Bugsee: Simulator builds don't carry symbolication-usable dSYMs. Skipping dSYM upload.")
+        return False
+    if not options.build_dir:
+        print('Bugsee: Target build directory was not specified for dSYM upload. Either provide it with the "-d" option or set TARGET_BUILD_DIR in the environment.')
+        return False
+    if options.dsym_list:
+        if len(args) < 2:
+            print("Bugsee: --list option is provided, but no dSYM files were passed on the command line. Skipping dSYM upload.")
+            return False
+    else:
+        if not options.dsym_folder:
+            print("Bugsee: Can not find dSYM folder for upload (expecting either a -f option or DWARF_DSYM_FOLDER_PATH environment variable). Skipping dSYM upload.")
+            return False
+    return True
+
+
+def run_dsym_flow(app_token):
+    """Legacy dSYM upload flow — unchanged behavior from the original
+    BugseeAgent, pulled out of `main()` so the new dispatcher can run
+    it alongside the size-analysis flow."""
     tempDir = tempfile.mkdtemp()
     print("Processing in " + tempDir)
     zipFileLocation = os.path.join(tempDir, 'symbols.zip')
@@ -221,7 +1785,7 @@ def main():
             if (os.stat(f).st_size == 0):
                 continue
             with zipfile.ZipFile(f, 'r') as zipf:
-                zipf.extractall(tempDir) 
+                zipf.extractall(tempDir)
 
     os.chdir(options.dsym_folder)
     for root, dirs, files in os.walk(options.dsym_folder):
@@ -258,13 +1822,35 @@ def main():
 
             zipf.close()
 
-        result = uploadZipFile(zipFileLocation)
+        result = uploadZipFile(app_token, zipFileLocation)
         if result:
             saveUploadedList(uploadedImages)
 
-
     # cleanup
     shutil.rmtree(tempDir, ignore_errors=True)
+
+
+def main():
+    """Entry-point dispatcher. Runs the dSYM upload (legacy default)
+    when the preflight passes, and the size-analysis upload when the
+    user has opted in via BUGSEE_SIZE_ANALYSIS_ENABLED. The two flows
+    are independent — if one skips or fails, the other still runs."""
+    app_token = args[0]
+
+    if should_run_dsym_flow():
+        try:
+            run_dsym_flow(app_token)
+        except Exception as e:
+            # Never let a dSYM-side failure take down a subsequent
+            # size-analysis attempt. The log line gives enough signal
+            # for the user to troubleshoot.
+            print("Bugsee: dSYM upload failed: %s" % e)
+
+    if should_run_size_analysis_flow():
+        try:
+            run_size_analysis_flow(app_token)
+        except Exception as e:
+            print("Bugsee: size-analysis upload failed: %s" % e)
 
 
 if __name__ == "__main__":
@@ -329,34 +1915,18 @@ if __name__ == "__main__":
         os.dup2(so.fileno(), sys.stdout.fileno())
         os.dup2(se.fileno(), sys.stderr.fileno())
 
-        if os.environ.get('DEBUG_INFORMATION_FORMAT') != 'dwarf-with-dsym':
-            print("Bugsee:  DEBUG_INFORMATION_FORMAT is not set. Have you enabled debug symbols in your build? See: https://docs.bugsee.com/sdk/ios/symbolication/")
-            exit(0)
-
-        if os.environ.get('EFFECTIVE_PLATFORM_NAME') == '-iphonesimulator':
-            print("Bugsee:  Bugsee is not supoorted in iOS simulator. Will not upload debug symbols for i386!")
-            exit(0)
-
+    # dSYM-specific preflight now lives in `should_run_dsym_flow()`
+    # so an absent DEBUG_INFORMATION_FORMAT doesn't kill the
+    # size-analysis path. Size-analysis gating happens inside its
+    # own `should_run_size_analysis_flow()` check.
 
     if (len(args) < 1):
         print("Bugsee:  Not initialized with app token. Must be passed as a parameter")
         exit(1)
 
-    APP_TOKEN = args[0]
-
-    if not options.build_dir:
-        print('Target build directory was not specified. Either provide it with the "-d" option or set "TARGET_BUILD_DIR" environment variable')
-        exit(1)
-
-    if options.dsym_list:
-        dsym_list = args[1:]
-        if len(dsym_list) < 1:
-            print("Bugsee:  --list option is provided, but no dSYM files can be found in the command line")
-            exit(1)
-    else:
-        if not options.dsym_folder:
-            print("Bugsee:  Can not find dSYM folder (expecting either a -f option or DWARF_DSYM_FOLDER_PATH)")
-            exit(1)
+    # `main()` dispatches into the two flows; each gates itself and
+    # reports its own skip/failure reason. `APP_TOKEN` is read off
+    # `args[0]` inside the dispatcher.
 
     # start the daemon main loop
-    main() 
+    main()
