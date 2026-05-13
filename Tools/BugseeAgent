@@ -21,17 +21,51 @@
 # "Add Environment Variable" in the scheme, or exported in a CI step
 # before invoking xcodebuild):
 #
-#   BUGSEE_SIZE_ANALYSIS_ENABLED
-#     Master switch for build/size-analysis upload. Default OFF. When
-#     unset the agent uploads dSYMs only — the legacy behavior — and
-#     no IPA is sent. Set to `1` / `true` / `yes` / `on` to opt in.
+#   BUGSEE_BUILD_INFO_ENABLED
+#     Master switch for build-info upload. Default ON — every Release
+#     archive registers a build record on Bugsee servers (version,
+#     build, package_id, VCS, machine, plugin / Xcode / SDK versions,
+#     timings, artefact file size). The record unlocks crash
+#     enrichment, dashboard build history, and the in-build
+#     size-check baseline. No artefact bytes are uploaded by default.
+#     Set to `0` / `false` / `no` / `off` to opt out (firewalled CI,
+#     privacy-sensitive builds).
 #
-#   BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS
-#     When the master switch is on, upload the archive for every build
-#     configuration. Default OFF → only $CONFIGURATION == Release is
-#     uploaded. Set to `1` / `true` / `yes` / `on` to include Debug /
-#     custom configurations (not recommended for production dashboards
-#     since debug binaries aren't representative of shipping size).
+#   BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS
+#     Include every build configuration, not just Release. Default
+#     OFF — only `$CONFIGURATION == Release` runs build-info, since
+#     Debug builds aren't user-facing artefacts and registering them
+#     would just clutter the dashboard. The legacy
+#     `BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS` env var is honoured
+#     as a deprecated alias during the transition.
+#
+#   BUGSEE_BUILD_INFO_ALL_ACTIONS
+#     Include every Xcode action (Build, Build & Run, Test), not just
+#     Archive. Default OFF — `BugseeAgent` is normally wired into the
+#     scheme's Archive post-action where `$ARCHIVE_PATH` is populated.
+#     Set this to `1` to also register builds produced by a plain
+#     Build action (the `.app` is taken from
+#     `$TARGET_BUILD_DIR/$WRAPPER_NAME` in that case).
+#
+#     CAVEAT: Debug Build artefacts are unsigned, unthinned, and
+#     contain debug-only assets — their `artifact_size` is not
+#     comparable to a Release archive's size. The size-check feature
+#     scopes its baseline by `(package_id, format, build_configuration)`
+#     so cross-configuration comparisons don't happen, but the user
+#     should be aware that every Build & Run will now produce a
+#     build record. Use this option deliberately (e.g. for projects
+#     that want every CI build registered for crash-context lookup,
+#     not for everyday developer iteration).
+#
+#   BUGSEE_SIZE_ANALYSIS_ENABLED
+#     Sub-feature of build-info: when set, the build-info POST also
+#     asks the server for a presigned PUT URL and ships the artefact
+#     bytes for server-side size-tree analysis. Default OFF —
+#     build-info on its own already records `artifact_size`, which
+#     is enough for the size-check feature. Requires
+#     `BUGSEE_BUILD_INFO_ENABLED` to be on (the default); the agent
+#     warns and skips both if size-analysis is set while build-info
+#     is disabled.
 #
 #   BUGSEE_SIZE_ANALYSIS_DEBUG
 #     Verbose logging for the size-analysis flow — echoes the init
@@ -40,13 +74,13 @@
 #
 #   BUGSEE_SIZE_CHECK_ENABLED
 #     Master switch for the in-build size-check. Default OFF. When
-#     enabled (alongside BUGSEE_SIZE_ANALYSIS_ENABLED), the agent
-#     queries the appserver for the most recent prior build's
-#     recorded artefact size and compares it to the current build.
-#     Crossing a configured threshold prints `warning:` / `error:`
-#     prefixed lines and (on FAIL) exits non-zero. Each threshold
-#     below is independently optional; a value of 0 / unset disables
-#     that gate. Negative deltas (artefact shrunk) never trigger.
+#     enabled (build-info on, the default) the agent queries the
+#     appserver for the most recent prior build's recorded artefact
+#     size and compares it to the current build. Crossing a
+#     configured threshold prints `warning:` / `error:` prefixed
+#     lines and (on FAIL) exits non-zero. Each threshold below is
+#     independently optional; a value of 0 / unset disables that
+#     gate. Negative deltas (artefact shrunk) never trigger.
 #
 #   BUGSEE_SIZE_CHECK_WARNING_PCT       e.g. 5.0 → warn at +5%
 #   BUGSEE_SIZE_CHECK_FAIL_PCT          e.g. 10.0 → fail at +10%
@@ -75,6 +109,8 @@ import uuid
 import gzip
 import socket
 import math
+import time
+import concurrent.futures
 from optparse import OptionParser
 import fnmatch
 
@@ -487,6 +523,100 @@ def _plist_value(plist_path, key):
         return None
 
 
+# Architecture preference order. arm64 wins because that's what ships
+# on iPhone / iPad device installs — the runtime SDK's `LC_UUID` read
+# in BGSCrashReport.m will resolve to this slice for any device build.
+# Simulator architectures rank below but are still considered so a
+# simulator-only Debug Build (no device slice present) still gets a
+# usable identifier. The trailing fallback is "whatever slice came
+# first", which covers exotic build configurations.
+_PREFERRED_MACHO_ARCHS = ('arm64', 'arm64e', 'x86_64', 'arm64-simulator', 'x86_64-simulator')
+
+
+def get_main_executable_uuid(app_path):
+    """Extract the main executable's Mach-O `LC_UUID` and return it
+    formatted to match the iOS SDK's runtime reporting shape (32
+    lowercase hex chars, no dashes — same as
+    `BGSCrashReport.m:685–690`).
+
+    Why: the iOS SDK already reports `LC_UUID` with every crash for
+    dSYM symbolication. If the BugseeAgent's upload payload carries
+    the same `LC_UUID` as the build record's `uuid`, the server can
+    deterministically join `crash.uuid → build` without any new
+    infrastructure (no Info.plist injection, no pre-build phase).
+    The linker assigns a fresh `LC_UUID` per build, so each build
+    still gets a unique identifier the way Android's
+    `UUID.randomUUID()` does.
+
+    Multi-arch handling: when an .app's main Mach-O is a fat binary
+    (mostly seen in Debug / non-thinned builds), there's one
+    `LC_UUID` per slice. We prefer `arm64` (the shipping device
+    arch), then progressively fall back through simulator arches,
+    then the first slice that `dwarfdump` reports. That keeps the
+    on-device crash → build lookup deterministic for App Store
+    artefacts and gives simulator-only Debug builds a non-empty
+    identifier too.
+
+    Returns `None` on any failure (missing CFBundleExecutable, binary
+    not found, dwarfdump non-zero exit, no UUID lines in output). The
+    caller falls back to `uuid.uuid4()` so the upload always carries
+    *some* identifier, but matching with crash reports is best-effort
+    in the fallback case.
+    """
+    if not app_path or not os.path.isdir(app_path):
+        return None
+
+    plist = os.path.join(app_path, 'Info.plist')
+    executable_name = _plist_value(plist, 'CFBundleExecutable')
+    if not executable_name:
+        return None
+
+    binary_path = os.path.join(app_path, executable_name)
+    if not os.path.isfile(binary_path):
+        return None
+
+    try:
+        result = subprocess.run(
+            ['/usr/bin/dwarfdump', '-u', binary_path],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+
+    # `dwarfdump -u` output lines look like:
+    #   UUID: 12345678-1234-1234-1234-123456789012 (arm64) /path/to/binary
+    # One line per Mach-O slice. Parse into (arch → uuid) and pick
+    # the best-matching arch.
+    slices = {}
+    pattern = re.compile(r'^\s*UUID:\s*([0-9A-Fa-f-]+)\s*\(([^)]+)\)')
+    for line in (result.stdout or '').splitlines():
+        m = pattern.match(line)
+        if m:
+            uuid_str = m.group(1)
+            arch = m.group(2).strip()
+            slices[arch] = uuid_str
+
+    if not slices:
+        return None
+
+    # Prefer the architecture order above; fall back to first reported.
+    selected = None
+    for arch in _PREFERRED_MACHO_ARCHS:
+        if arch in slices:
+            selected = slices[arch]
+            break
+    if selected is None:
+        # Whichever arch came first — deterministic enough for the
+        # exotic-multi-arch case.
+        selected = next(iter(slices.values()))
+
+    # Normalise to lowercase hex, no dashes, matching the iOS SDK's
+    # `[NSString stringWithFormat:@"%02X..."] lowercaseString` shape.
+    return selected.replace('-', '').lower()
+
+
 def resolve_xcode_version():
     """Returns the short Xcode version (e.g. `"16.2"`) or None. Tries
     `$XCODE_VERSION_ACTUAL` first (set in every Run Script env —
@@ -558,6 +688,59 @@ def find_app_in_archive(archive_path):
         if entry.endswith('.app') and os.path.isdir(candidate):
             return candidate
     return None
+
+
+def find_app_in_build_dir(env):
+    """Locate the `.app` produced by a regular Build action (no
+    .xcarchive). Xcode populates `$TARGET_BUILD_DIR` and
+    `$WRAPPER_NAME` (e.g. `MyApp.app`) on every build phase /
+    post-action — combined they give the absolute path to the
+    just-built `.app`. `$EXECUTABLE_FOLDER_PATH` is the relative
+    counterpart inside an `.xcarchive`-aware setup and serves as a
+    secondary fallback.
+
+    Returns `None` when neither env var resolves to an existing
+    directory — the caller treats that as "skip".
+    """
+    target_build_dir = (env.get('TARGET_BUILD_DIR') or '').strip()
+    if not target_build_dir or not os.path.isdir(target_build_dir):
+        return None
+    wrapper = (env.get('WRAPPER_NAME') or '').strip()
+    if wrapper:
+        candidate = os.path.join(target_build_dir, wrapper)
+        if os.path.isdir(candidate) and wrapper.endswith('.app'):
+            return candidate
+    exec_folder = (env.get('EXECUTABLE_FOLDER_PATH') or '').strip()
+    if exec_folder:
+        candidate = os.path.join(target_build_dir, exec_folder)
+        if os.path.isdir(candidate) and exec_folder.endswith('.app'):
+            return candidate
+    # Last resort: scan the build dir for a single `.app`. Useful for
+    # exotic build setups where neither env var is populated.
+    matches = [
+        e for e in sorted(os.listdir(target_build_dir))
+        if e.endswith('.app') and os.path.isdir(os.path.join(target_build_dir, e))
+    ]
+    if len(matches) == 1:
+        return os.path.join(target_build_dir, matches[0])
+    return None
+
+
+def find_app(env):
+    """Resolve the `.app` path for the build-publish flow.
+
+    Tries the Archive path first (`$ARCHIVE_PATH` populated when
+    `ACTION=install`), then falls through to the Build-action path
+    (`$TARGET_BUILD_DIR/$WRAPPER_NAME`). The two-phase resolution
+    lets a single `should_run_build_publish_flow()` admit both
+    contexts: Archive runs unconditionally when build-info is on,
+    plain Build runs only when the user opts in via
+    `BUGSEE_BUILD_INFO_ALL_ACTIONS=1`.
+    """
+    archive_path = (env.get('ARCHIVE_PATH') or '').strip()
+    if archive_path and os.path.isdir(archive_path):
+        return find_app_in_archive(archive_path)
+    return find_app_in_build_dir(env)
 
 
 # File extensions whose contents are already compressed by the
@@ -714,6 +897,22 @@ def upload_build(endpoint, app_token, ipa_path, payload, debug=False):
         result = parsed
 
     presigned = (result or {}).get('endpoint') if isinstance(result, dict) else None
+    requested_artifact_upload = bool(payload.get('request_artifact_upload'))
+
+    # Build-info-only path: the request didn't ask for a presigned URL,
+    # so the response carrying just `{ build_id, size_analysis_status }`
+    # is success. The artefact lives only on the build host.
+    if not requested_artifact_upload:
+        if presigned:
+            # Server returned a URL we didn't ask for. Treat as a
+            # server bug rather than uploading something we weren't
+            # planning to ship.
+            print("Bugsee: build-info upload received an unexpected presigned URL — ignoring.")
+        if debug:
+            print("Bugsee: build-info upload complete (no artefact requested)")
+        return True
+
+    # Size-analysis path: presigned URL is required.
     if not presigned:
         print("Bugsee: build create returned no endpoint: %s" % raw[:300])
         return False
@@ -754,10 +953,375 @@ def upload_build(endpoint, app_token, ipa_path, payload, debug=False):
         return False
 
     if 200 <= status < 300:
-        print("Bugsee: size-analysis upload complete (HTTP %d)" % status)
+        print("Bugsee: build upload complete (HTTP %d)" % status)
         return True
     print("Bugsee: artefact PUT unexpected status: %d" % status)
     return False
+
+
+# -----------------------------------------------------------------
+# Chunked upload — split → POST chunks/check → PUT missing →
+# POST /chunked
+# -----------------------------------------------------------------
+#
+# Mirrors the Android Gradle plugin's `ChunkedBundleUploader.kt`
+# four-phase flow exactly so a single server-side chunked-upload
+# implementation handles both platforms. Wire protocol details:
+#
+#   1. GET  /v2/apps/{token}/builds/chunk-options       — negotiate
+#         params (chunk_size, max_chunks, expires_sec).
+#   2. POST /v2/apps/{token}/builds/chunks/check        — body
+#         `{sha1_list: [...]}`. Server HEADs each sha against
+#         `chunks/sha1/<sha>` in the upload bucket and returns
+#         `{missing: [...], upload_urls: {sha: presigned_put_url}}`.
+#   3. PUT  <presigned_url>                              — one per
+#         missing chunk; `Content-Type: application/octet-stream`
+#         is mandatory (the server signs that exact CT, S3 403s on
+#         mismatch).
+#   4. POST /v2/apps/{token}/builds/chunked              — body is
+#         the standard `upload_build` payload plus `chunks: [sha…]`;
+#         server stitches via S3 multipart UploadPartCopy.
+#
+# Failure model: this whole module is best-effort. Any exception
+# bubbles up to `try_chunked_upload`, which logs and returns False —
+# the dispatcher then falls back to the existing single-PUT path
+# rather than failing the build. Same try/catch + fall-back shape as
+# `BundleUploadTask.kt:358–360`.
+
+# S3 multipart requires every non-terminal part to be >= 5 MiB. We
+# cross-check on the client too so a misconfigured server can't waste
+# a chunked-upload attempt before the stitch rejects the parts.
+_S3_MIN_PART_BYTES = 5 * 1024 * 1024
+
+# Per-chunk retry parameters. Transient S3 5xx or network blips
+# shouldn't kill the whole chunked path once we've already shipped
+# several MiB of a multi-GiB archive.
+_CHUNK_PUT_MAX_ATTEMPTS = 3
+_CHUNK_PUT_BACKOFF_BASE_S = 0.5
+
+# Bounded-parallel chunk PUTs. Sequential PUTs would serialise the
+# upload by RTT (death on long-haul CI runners); unbounded parallelism
+# would starve file descriptors and trip ulimits. 4 hits the sweet
+# spot on hosted-macOS for typical IPA sizes.
+_CHUNK_PUT_CONCURRENCY = 4
+
+
+def _compute_chunk_hashes(path, chunk_size):
+    """Return ordered list of SHA-1 hex digests, one per `chunk_size`
+    slice of the file. The final chunk may be shorter than chunk_size
+    when the file size isn't a multiple of chunk_size — that's the
+    same contract as the Kotlin uploader and the server's stitch
+    handles it via S3 multipart's "last part may be smaller" rule.
+    Reads in 64 KiB increments so memory stays bounded regardless
+    of artefact size."""
+    READ_BUF = 64 * 1024
+    hashes = []
+    with open(path, 'rb') as fp:
+        while True:
+            h = hashlib.sha1()
+            n = 0
+            while n < chunk_size:
+                buf = fp.read(min(READ_BUF, chunk_size - n))
+                if not buf:
+                    break
+                h.update(buf)
+                n += len(buf)
+            if n == 0:
+                # No bytes read at all — clean EOF on a boundary.
+                break
+            hashes.append(h.hexdigest())
+            if n < chunk_size:
+                # Short read means we hit EOF inside this chunk;
+                # it's the terminal partial chunk.
+                break
+    return hashes
+
+
+def _chunked_url(endpoint, app_token, suffix):
+    """Build a `/v2/apps/{token}/builds{suffix}` URL with the token
+    percent-encoded. Same shape as `upload_build`'s URL builder so
+    both endpoints follow the same v2 conventions."""
+    safe_token = urllib.parse.quote(app_token, safe='')
+    return '%s/v2/apps/%s/builds%s' % (endpoint.rstrip('/'), safe_token, suffix)
+
+
+def _read_response_body(resp):
+    return resp.read().decode('utf-8', errors='replace')
+
+
+def _unwrap_result(parsed):
+    """Pull the `result` payload out of the v2 envelope or return the
+    body itself if there's no wrapper. Matches the Kotlin uploader's
+    `ApiEndpoint.unwrapResult`."""
+    if isinstance(parsed, dict) and 'result' in parsed:
+        return parsed.get('result')
+    return parsed
+
+
+def _fetch_chunk_options(endpoint, app_token):
+    url = _chunked_url(endpoint, app_token, '/chunk-options')
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            raw = _read_response_body(resp)
+    except urllib.error.HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        raise RuntimeError("chunk-options HTTP %d: %s" % (e.code, body[:300])) from e
+
+    parsed = json.loads(raw)
+    result = _unwrap_result(parsed)
+    if not isinstance(result, dict) or 'chunk_size' not in result or 'max_chunks' not in result:
+        raise RuntimeError("chunk-options response missing required fields: %s" % raw[:300])
+    return result
+
+
+def _check_chunks(endpoint, app_token, hashes):
+    url = _chunked_url(endpoint, app_token, '/chunks/check')
+    body = json.dumps({'sha1_list': hashes}).encode('utf-8')
+    req = urllib.request.Request(url, data=body, method='POST')
+    req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = _read_response_body(resp)
+    except urllib.error.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        raise RuntimeError("chunks/check HTTP %d: %s" % (e.code, err_body[:300])) from e
+
+    parsed = json.loads(raw)
+    result = _unwrap_result(parsed)
+    if not isinstance(result, dict):
+        raise RuntimeError("chunks/check response missing 'result': %s" % raw[:300])
+    return result
+
+
+def _put_one_chunk(file_path, index, chunk_size, presigned_url):
+    """Upload one chunk to its presigned URL. Retries up to
+    `_CHUNK_PUT_MAX_ATTEMPTS` on transient 5xx / network errors;
+    fails fast on 4xx (expired URL, bad signature — retry is
+    wasted bandwidth). Raises on terminal failure."""
+    offset = index * chunk_size
+    total = os.path.getsize(file_path)
+    wanted = min(chunk_size, total - offset)
+
+    # Read the slice once. Each thread reads its own bytes so we
+    # don't need to coordinate access to a shared buffer — different
+    # PUTs come from disjoint regions of the same file.
+    with open(file_path, 'rb') as fp:
+        fp.seek(offset)
+        data = fp.read(wanted)
+
+    last_err = None
+    for attempt in range(1, _CHUNK_PUT_MAX_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(presigned_url, data=data, method='PUT')
+            # Content-Type must match the server's signing — the
+            # appserver signs with `application/octet-stream` and S3
+            # 403s on a mismatched header. urllib auto-injects a
+            # default Content-Type for POST/PUT with bytes data,
+            # so this is also a hedge against that.
+            req.add_header('Content-Type', 'application/octet-stream')
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                if 200 <= resp.status < 300:
+                    return
+                # 2xx but unexpected — treat as transient (the
+                # response body might tell us why).
+                last_err = IOError("chunk PUT HTTP %d" % resp.status)
+        except urllib.error.HTTPError as e:
+            # 4xx is permanent; surface the body so the caller log
+            # actually says something useful.
+            if 400 <= e.code < 500:
+                body = ''
+                try:
+                    body = e.read().decode('utf-8', errors='replace')
+                except Exception:
+                    pass
+                raise RuntimeError("chunk PUT failed (HTTP %d): %s" % (e.code, body[:300])) from e
+            last_err = e
+        except (urllib.error.URLError, IOError, socket.timeout) as e:
+            last_err = e
+        if attempt < _CHUNK_PUT_MAX_ATTEMPTS:
+            time.sleep(_CHUNK_PUT_BACKOFF_BASE_S * attempt)
+    raise RuntimeError("chunk PUT failed after %d attempts: %s" % (_CHUNK_PUT_MAX_ATTEMPTS, last_err))
+
+
+def _upload_missing_chunks(file_path, chunk_size, all_hashes, missing, upload_urls):
+    """PUT each missing chunk to its presigned URL with bounded
+    parallelism. A chunk hash that appears more than once in
+    `all_hashes` (duplicate-content regions) is PUT exactly once —
+    the server's stitch references by PartNumber, not key, so one
+    upload covers all occurrences. Mirrors the Kotlin uploader's
+    `missingSet` + `uploaded` deduplication."""
+    missing_set = set(missing)
+    seen = set()
+    tasks = []  # list of (sha, index) — first occurrence of each missing sha
+    for index, sha in enumerate(all_hashes):
+        if sha not in missing_set:
+            continue
+        if sha in seen:
+            continue
+        seen.add(sha)
+        if sha not in upload_urls:
+            # Server bug — claimed missing but didn't sign a URL.
+            raise RuntimeError("chunks/check listed %s as missing but provided no upload URL" % sha)
+        tasks.append((sha, index))
+
+    if not tasks:
+        return
+
+    errors = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_CHUNK_PUT_CONCURRENCY) as ex:
+        futures = {
+            ex.submit(_put_one_chunk, file_path, index, chunk_size, upload_urls[sha]): sha
+            for sha, index in tasks
+        }
+        # Let the pool drain so every uploaded chunk that succeeded
+        # leaves no orphans on the next attempt (S3 will dedup any
+        # re-uploads via content-addressed key). Collect all errors
+        # so the log shows the full failure surface, not just the
+        # first.
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                errors.append((futures[fut], e))
+
+    if errors:
+        details = "; ".join("%s: %s" % (sha[:12], e) for sha, e in errors)
+        raise RuntimeError("chunked-upload PUT errors (%d failed): %s" % (len(errors), details))
+
+
+def _submit_chunked(endpoint, app_token, payload, hashes):
+    """POST the build registration with `chunks: [sha…]`. Returns
+    the server-assigned build_id; raises on any failure shape
+    (HTTP error, non-JSON, missing build_id) so the caller can fall
+    back to single-PUT."""
+    url = _chunked_url(endpoint, app_token, '/chunked')
+    body_dict = dict(payload)
+    # `request_artifact_upload` on the single-PUT path tells the
+    # server "sign me a presigned URL". The chunked path inherently
+    # implies "upload the artefact", so the field is meaningless
+    # here — drop it before sending to avoid confusing future
+    # readers of server logs.
+    body_dict.pop('request_artifact_upload', None)
+    body_dict['chunks'] = list(hashes)
+    body = json.dumps(body_dict).encode('utf-8')
+
+    req = urllib.request.Request(url, data=body, method='POST')
+    req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = _read_response_body(resp)
+    except urllib.error.HTTPError as e:
+        err_body = ''
+        try:
+            err_body = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            pass
+        raise RuntimeError("/builds/chunked HTTP %d: %s" % (e.code, err_body[:300])) from e
+
+    parsed = json.loads(raw)
+    result = _unwrap_result(parsed)
+    if not isinstance(result, dict):
+        raise RuntimeError("/builds/chunked returned no result: %s" % raw[:300])
+    build_id = result.get('build_id')
+    if not build_id:
+        # 2xx without build_id means the worker pipeline has no key
+        # to look us up by — fail loud so the caller falls back to
+        # single-PUT rather than thinking everything's fine.
+        raise RuntimeError("/builds/chunked returned 2xx without build_id: %s" % raw[:300])
+    return build_id
+
+
+def try_chunked_upload(endpoint, app_token, ipa_path, payload, debug=False):
+    """Attempt chunked upload of `ipa_path`. Returns True on success,
+    False if any phase failed. Does NOT raise — every error path
+    prints a diagnostic and returns False so the dispatcher can fall
+    back to the single-PUT `upload_build` cleanly.
+
+    Mirrors `upload_build`'s signature so swap-in is trivial."""
+    try:
+        opts = _fetch_chunk_options(endpoint, app_token)
+        chunk_size = int(opts['chunk_size'])
+        max_chunks = int(opts['max_chunks'])
+    except Exception as e:
+        print("Bugsee: chunked upload — chunk-options failed: %s" % e)
+        return False
+
+    if chunk_size < _S3_MIN_PART_BYTES:
+        print("Bugsee: chunked upload rejected — server chunk_size=%d below S3 minimum %d"
+              % (chunk_size, _S3_MIN_PART_BYTES))
+        return False
+    if max_chunks < 1:
+        print("Bugsee: chunked upload rejected — server max_chunks=%d" % max_chunks)
+        return False
+
+    if debug:
+        print("Bugsee: chunked upload — chunk_size=%d max_chunks=%d" % (chunk_size, max_chunks))
+
+    try:
+        hashes = _compute_chunk_hashes(ipa_path, chunk_size)
+    except Exception as e:
+        print("Bugsee: chunked upload — hashing failed: %s" % e)
+        return False
+
+    if not hashes:
+        print("Bugsee: chunked upload — artefact has zero bytes; falling back")
+        return False
+    if len(hashes) > max_chunks:
+        print("Bugsee: chunked upload rejected — %d chunks > server max %d"
+              % (len(hashes), max_chunks))
+        return False
+
+    if debug:
+        print("Bugsee: chunked upload — computed %d chunks" % len(hashes))
+
+    try:
+        check = _check_chunks(endpoint, app_token, hashes)
+    except Exception as e:
+        print("Bugsee: chunked upload — chunks/check failed: %s" % e)
+        return False
+
+    missing = check.get('missing', []) if isinstance(check, dict) else []
+    upload_urls = check.get('upload_urls', {}) if isinstance(check, dict) else {}
+
+    if debug:
+        print("Bugsee: chunked upload — %d / %d chunks need upload"
+              % (len(missing), len(hashes)))
+
+    if missing:
+        try:
+            _upload_missing_chunks(ipa_path, chunk_size, hashes, missing, upload_urls)
+        except Exception as e:
+            print("Bugsee: chunked upload — PUT phase failed: %s" % e)
+            return False
+
+    try:
+        build_id = _submit_chunked(endpoint, app_token, payload, hashes)
+    except Exception as e:
+        print("Bugsee: chunked upload — /chunked submit failed: %s" % e)
+        return False
+
+    # Log the dedup outcome with UNIQUE counts — `missing` from the
+    # server may list a duplicate-content sha multiple times (once per
+    # occurrence), so the raw length overstates how many bytes we
+    # actually shipped. Same for `hashes`. The numbers users actually
+    # care about are "distinct chunks needed to upload" out of
+    # "distinct chunks total".
+    unique_uploaded = len(set(missing))
+    unique_total = len(set(hashes))
+    if debug:
+        print("Bugsee: chunked upload complete build_id=%s" % build_id)
+    else:
+        print("Bugsee: build upload complete (chunked, %d/%d new chunks)"
+              % (unique_uploaded, unique_total))
+    return True
 
 
 # -----------------------------------------------------------------
@@ -1554,56 +2118,180 @@ def resolve_build_timings(env):
 
 
 # -----------------------------------------------------------------
-# Size-analysis flow + gate
+# Build-publish flow + gate
 # -----------------------------------------------------------------
+#
+# The flow has two layers:
+#
+#   - **build-info** (default ON, release-only): every Release archive
+#     posts a build record to the Bugsee appserver carrying version,
+#     build, package_id, VCS, build-machine, plugin / Xcode / SDK
+#     versions, timings, and the artefact's file size. The record
+#     unlocks crash-context enrichment (commit lookup) and serves as
+#     the in-build size-check baseline. Disable via
+#     `BUGSEE_BUILD_INFO_ENABLED=0` for firewalled CI / privacy-
+#     sensitive builds.
+#
+#   - **size-analysis** (default OFF, sub-feature of build-info):
+#     when enabled, the build-info POST also asks the server for a
+#     presigned PUT URL and ships the artefact bytes for server-side
+#     tree analysis. Requires build-info to be enabled — the flow
+#     warns and skips both if size-analysis is on while build-info
+#     is off.
 
-def should_run_size_analysis_flow():
-    """Gate for the new size-analysis upload. Defaults to OFF — users
-    must explicitly opt in via BUGSEE_SIZE_ANALYSIS_ENABLED. When on,
-    restricted to Release configurations unless
-    BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS is also set.
 
-    Requires `$ACTION == install` (= Xcode's Archive action) so the
-    `.xcarchive` is available at `$ARCHIVE_PATH`. Scheme post-actions
-    on Build don't carry an archive.
+def _env_truthy_default_true(value):
+    """`True` for missing / unset / empty values (treated as "default
+    on") AND for conventional truthy tokens. Used by the build-info
+    gate where the default is ON.
+
+    Empty string is treated as missing: many GUIs (Xcode's "Add
+    Environment Variable", some CI dashboards) emit `BUGSEE_…=""`
+    when the user leaves the value field blank. Treating `""` as
+    "off" would silently flip a user who *thought* they were
+    accepting the default into the disabled path — confusing and
+    invisible."""
+    if value is None:
+        return True
+    if not value.strip():
+        return True
+    return _env_truthy(value)
+
+
+def should_run_build_publish_flow():
+    """Gate for the build-info / size-analysis upload flow. Returns
+    True when the agent should proceed to package, register the
+    build, and (conditionally) upload the artefact bytes.
+
+    Two entry points:
+      1. **Archive** (`$ACTION == 'install'` + valid `$ARCHIVE_PATH`).
+         Always permitted when build-info is enabled — same shape as
+         the Gradle plugin's `assemble<Release>` / `bundle<Release>`
+         path. The `.app` lives at
+         `<archive>/Products/Applications/*.app`.
+      2. **Plain Build** (e.g. ⌘R in Xcode, `xcodebuild build` in CI)
+         — Xcode does NOT populate `$ARCHIVE_PATH` here. Requires the
+         user to explicitly opt in via `BUGSEE_BUILD_INFO_ALL_ACTIONS=1`
+         since Debug Build artefacts are unsigned, unthinned, and
+         contain debug-only assets (their `artifact_size` is not
+         comparable to a Release archive — useful only when scoped
+         to the same `build_configuration`). The `.app` lives at
+         `$TARGET_BUILD_DIR/$WRAPPER_NAME`.
+
+    Skip conditions, in order:
+      - Neither entry point's preconditions hold (no archive AND
+        no opted-in build-dir fallback).
+      - `BUGSEE_BUILD_INFO_ENABLED` is explicitly truthy-false (the
+        default is ON).
+      - Build configuration is not Release and the user hasn't opted
+        in to all configurations via BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS.
+      - Misconfiguration: BUGSEE_SIZE_ANALYSIS_ENABLED is on while
+        BUGSEE_BUILD_INFO_ENABLED is explicitly off — warn loudly and
+        skip both. Size-analysis on its own would have nothing to
+        attach to.
     """
     env = os.environ
-    if not _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ENABLED')):
-        return False
 
+    # Pre-flight FIRST. If we wouldn't have run anyway (no archive
+    # AND no opted-in build-dir source) the misconfiguration warning
+    # would just be log noise — the user's flow is the dSYM-only
+    # legacy behaviour, not the build-publish flow.
     action = (env.get('ACTION') or '').strip()
-    if action != 'install':
-        print("Bugsee: size-analysis upload requires an Archive action "
-              "(got ACTION=%r). Skipping." % action)
+    archive_path = (env.get('ARCHIVE_PATH') or '').strip()
+    has_archive = action == 'install' and archive_path and os.path.isdir(archive_path)
+
+    all_actions_optin = _env_truthy(env.get('BUGSEE_BUILD_INFO_ALL_ACTIONS'))
+    target_build_dir = (env.get('TARGET_BUILD_DIR') or '').strip()
+    has_build_dir = all_actions_optin and target_build_dir and os.path.isdir(target_build_dir)
+
+    if not has_archive and not has_build_dir:
+        if action != 'install':
+            # Don't log the "needs archive" message in the all-actions
+            # path — the user has already opted in but their env is
+            # missing TARGET_BUILD_DIR (e.g. a CI step that invoked
+            # the script outside Xcode's environment block).
+            if all_actions_optin:
+                print("Bugsee: BUGSEE_BUILD_INFO_ALL_ACTIONS is set but "
+                      "TARGET_BUILD_DIR is missing — cannot locate the "
+                      ".app. Skipping.")
+            else:
+                print("Bugsee: build-info upload requires an Archive action "
+                      "(got ACTION=%r); set BUGSEE_BUILD_INFO_ALL_ACTIONS=1 "
+                      "to also register on plain Build actions. Skipping." % action)
+        else:
+            print("Bugsee: build-info upload could not locate the .xcarchive "
+                  "(ARCHIVE_PATH=%r). Skipping." % archive_path)
         return False
 
-    archive_path = (env.get('ARCHIVE_PATH') or '').strip()
-    if not archive_path or not os.path.isdir(archive_path):
-        print("Bugsee: size-analysis upload could not locate the .xcarchive "
-              "(ARCHIVE_PATH=%r). Skipping." % archive_path)
+    # Now resolve the gating flags. Validation only fires from this
+    # point on — when the user actually has an archive in hand and
+    # the misconfiguration is something they could act on.
+    build_info_enabled = _env_truthy_default_true(env.get('BUGSEE_BUILD_INFO_ENABLED'))
+    size_analysis_enabled = _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ENABLED'))
+
+    if not build_info_enabled:
+        if size_analysis_enabled:
+            # Configuration error: warn loudly, skip both. Never fails
+            # the build — same principle as the rest of this script.
+            print("Bugsee: BUGSEE_SIZE_ANALYSIS_ENABLED is set but "
+                  "BUGSEE_BUILD_INFO_ENABLED is disabled — "
+                  "size-analysis is a no-op without build-info. "
+                  "Either enable build-info or disable size-analysis.")
         return False
 
     config = (env.get('CONFIGURATION') or '').strip()
-    if config != 'Release' and not _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS')):
-        print("Bugsee: size-analysis upload skipped for configuration %r "
-              "(set BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS=1 to include "
+    # Release-only by default. The legacy
+    # `BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS` env var is honoured as
+    # an alias during the transition so users with existing CI scripts
+    # don't have to retrain. Drop the alias once usage of the new name
+    # is widespread.
+    all_configurations = (
+        _env_truthy(env.get('BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS'))
+        or _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS'))
+    )
+    # Case-insensitive match plus a "starts-with-release" allowance —
+    # custom build types like `ReleaseProduction` / `Release-AppStore`
+    # are common in real-world projects and are conceptually release
+    # builds. The strict-case `'Release'` check the legacy code used
+    # would silently exclude them. `release` (lowercase) is also fine.
+    config_norm = config.lower()
+    is_release = (config_norm == 'release' or config_norm.startswith('release'))
+    if not is_release and not all_configurations:
+        print("Bugsee: build-info upload skipped for configuration %r "
+              "(set BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS=1 to include "
               "non-Release configurations)." % config)
         return False
 
     return True
 
 
+# Legacy alias kept for callers that already imported the name. The
+# flow itself is gated by `should_run_build_publish_flow`; size-
+# analysis is a sub-feature, not its own gate. Drop after the next
+# release.
+def should_run_size_analysis_flow():
+    return should_run_build_publish_flow()
+
+
 def run_size_analysis_flow(app_token):
-    """Archive → synthetic IPA → upload. Runs inside the detached
-    daemon so archive wall-clock is untouched."""
+    """Locate the `.app` (from an .xcarchive on Archive runs, or from
+    `$TARGET_BUILD_DIR/$WRAPPER_NAME` when the user opted in to
+    BUGSEE_BUILD_INFO_ALL_ACTIONS) → synthetic IPA → upload. Runs
+    inside the detached daemon so the user-visible build wall-clock
+    is untouched."""
     env = os.environ
-    archive_path = env['ARCHIVE_PATH']
     endpoint = options.endpoint
 
-    app_path = find_app_in_archive(archive_path)
+    app_path = find_app(env)
     if not app_path:
-        print("Bugsee: no .app found inside %s/Products/Applications/. "
-              "Skipping size-analysis upload." % archive_path)
+        # `find_app` already tried the archive and the build-dir
+        # fallback; nothing usable resolved. Surface both candidate
+        # paths so the user can see which env vars were missing.
+        archive_path = (env.get('ARCHIVE_PATH') or '').strip()
+        target_build_dir = (env.get('TARGET_BUILD_DIR') or '').strip()
+        print("Bugsee: no .app found — checked ARCHIVE_PATH=%r and "
+              "TARGET_BUILD_DIR=%r. Skipping build-publish upload."
+              % (archive_path, target_build_dir))
         return
 
     bundle_id, version, build_number = resolve_bundle_info_from_app(app_path)
@@ -1642,13 +2330,22 @@ def run_size_analysis_flow(app_token):
         agent_version = resolve_agent_version()
 
         # Assemble the Android-compatible payload shape so the
-        # appserver persists both platforms identically. `uuid` is
-        # random per script invocation — matches Android's
-        # `UUID.randomUUID()` per Gradle build. Re-uploading the
-        # same archive would produce a new build record; that's
-        # consistent with Android behavior.
+        # appserver persists both platforms identically.
+        #
+        # `uuid` is the main executable's Mach-O `LC_UUID` — the same
+        # identifier the runtime SDK reports with every crash for
+        # dSYM symbolication (BGSCrashReport.m). Sending it here
+        # lets the appserver deterministically join
+        # `crash.uuid → build` without any Info.plist injection or
+        # pre-build phase. The linker assigns a fresh LC_UUID per
+        # build, so each build still gets a unique identifier the
+        # way Android's `UUID.randomUUID()` does. Fall back to
+        # `uuid.uuid4()` if extraction fails — the build record is
+        # still useful in the dashboard, just without crash-context
+        # join.
+        build_uuid = get_main_executable_uuid(app_path) or str(uuid.uuid4())
         payload = {
-            'uuid': str(uuid.uuid4()),
+            'uuid': build_uuid,
             'format': 'ipa',
         }
         if bundle_id:
@@ -1662,6 +2359,15 @@ def run_size_analysis_flow(app_token):
         config = (env.get('CONFIGURATION') or '').strip()
         if config:
             payload['build_configuration'] = config
+
+        # Size-analysis is the optional sub-feature that flips the
+        # appserver's flow from "register only" (default) to
+        # "register + sign a presigned PUT URL for the artefact".
+        # The IPA was packaged above regardless, since the size-check
+        # baseline always wants `artifact_size` recorded — the
+        # difference here is whether the bytes also get shipped.
+        size_analysis_enabled = _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ENABLED'))
+        payload['request_artifact_upload'] = size_analysis_enabled
         # VCS block — nested under `vcs` to match the appserver's
         # `VcsMetadataSchema`. Omitted entirely when the resolver
         # produced no fields (local dev machine, no CI context, no
@@ -1713,7 +2419,27 @@ def run_size_analysis_flow(app_token):
             debug=debug,
         )
 
-        upload_build(endpoint, app_token, ipa_path, payload, debug=debug)
+        # Chunked-upload path (opt-in via BUGSEE_CHUNKED_UPLOAD). Only
+        # meaningful when an artefact upload was requested — the
+        # build-info-only path has nothing to chunk. Falls back to
+        # the single-PUT `upload_build` on any failure so a flaky CI
+        # link or partially-deployed chunked stack can't break the
+        # user's archive flow. Mirrors `BundleUploadTask.kt:345–361`
+        # exactly.
+        chunked_requested = (
+            payload.get('request_artifact_upload')
+            and _env_truthy(env.get('BUGSEE_CHUNKED_UPLOAD'))
+        )
+        chunked_succeeded = False
+        if chunked_requested:
+            chunked_succeeded = try_chunked_upload(
+                endpoint, app_token, ipa_path, payload, debug=debug
+            )
+            if not chunked_succeeded:
+                print("Bugsee: chunked upload failed — falling back to single-PUT")
+
+        if not chunked_succeeded:
+            upload_build(endpoint, app_token, ipa_path, payload, debug=debug)
 
         # In-build size-check evaluation. Runs regardless of upload
         # outcome — the check only needs the local size + the
@@ -1832,9 +2558,11 @@ def run_dsym_flow(app_token):
 
 def main():
     """Entry-point dispatcher. Runs the dSYM upload (legacy default)
-    when the preflight passes, and the size-analysis upload when the
-    user has opted in via BUGSEE_SIZE_ANALYSIS_ENABLED. The two flows
-    are independent — if one skips or fails, the other still runs."""
+    when the preflight passes, and the build-publish flow (build-info
+    by default; build-info + size-analysis when the user opts in via
+    BUGSEE_SIZE_ANALYSIS_ENABLED) when the build-info preflight passes.
+    The two flows are independent — if one skips or fails, the other
+    still runs."""
     app_token = args[0]
 
     if should_run_dsym_flow():
@@ -1842,15 +2570,15 @@ def main():
             run_dsym_flow(app_token)
         except Exception as e:
             # Never let a dSYM-side failure take down a subsequent
-            # size-analysis attempt. The log line gives enough signal
+            # build-publish attempt. The log line gives enough signal
             # for the user to troubleshoot.
             print("Bugsee: dSYM upload failed: %s" % e)
 
-    if should_run_size_analysis_flow():
+    if should_run_build_publish_flow():
         try:
             run_size_analysis_flow(app_token)
         except Exception as e:
-            print("Bugsee: size-analysis upload failed: %s" % e)
+            print("Bugsee: build upload failed: %s" % e)
 
 
 if __name__ == "__main__":
