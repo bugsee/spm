@@ -57,6 +57,17 @@
 #     that want every CI build registered for crash-context lookup,
 #     not for everyday developer iteration).
 #
+#   BUGSEE_BUILD_INFO_TIMINGS_ENABLED
+#     Sub-feature of build-info: per-section build timings extracted
+#     from Xcode's `.xcactivitylog`. Default ON — the inline
+#     `build_metadata.timings` block (`total_ms`, `top_tasks`,
+#     per-category `native_ms` / `resources_ms` / `packaging_ms` /
+#     `other_ms`) is included in the build-info POST when the agent
+#     finds a usable activity log. Set to `0` / `false` / `no` / `off`
+#     to opt out (privacy-sensitive shops that don't want target /
+#     section names on external servers). Mirrors the Gradle plugin's
+#     `bugsee.buildInfo.timings.enabled` DSL flag.
+#
 #   BUGSEE_SIZE_ANALYSIS_ENABLED
 #     Sub-feature of build-info: when set, the build-info POST also
 #     asks the server for a presigned PUT URL and ships the artefact
@@ -75,7 +86,7 @@
 #   BUGSEE_SIZE_CHECK_ENABLED
 #     Master switch for the in-build size-check. Default OFF. When
 #     enabled (build-info on, the default) the agent queries the
-#     appserver for the most recent prior build's recorded artefact
+#     back-end for the most recent prior build's recorded artefact
 #     size and compares it to the current build. Crossing a
 #     configured threshold prints `warning:` / `error:` prefixed
 #     lines and (on FAIL) exits non-zero. Each threshold below is
@@ -298,8 +309,8 @@ def uploadZipFile(app_token, zipFileLocation):
 # feature. It mirrors the Android Gradle plugin's behavior: capture
 # build-process provenance (machine / CI runner, VCS metadata,
 # Xcode + agent versions), package the `.xcarchive`'s `.app` as a
-# synthetic `.ipa`, and upload both to the worker via the
-# two-stage presigned-URL protocol the appserver exposes.
+# synthetic `.ipa`, and upload both to the back-end via the
+# two-stage presigned-URL protocol the back-end exposes.
 #
 # Entirely opt-in (see BUGSEE_SIZE_ANALYSIS_ENABLED in the usage
 # comment at the top of this file). Zero effect on the existing
@@ -314,7 +325,7 @@ def uploadZipFile(app_token, zipFileLocation):
 def resolve_machine_label():
     """Returns a `<provider>[:<detail>]` label describing where the
     build ran — mirrors the cascade in Android's BuildMachineResolver
-    so the viewer can group iOS + Android builds from the same CI
+    so the front-end can group iOS + Android builds from the same CI
     runner. Pure env-based detection; no shelling out.
 
     First positive provider signal wins. `None` when nothing matches
@@ -374,7 +385,7 @@ def _local_hostname():
 def resolve_vcs_metadata(working_dir):
     """Returns a dict shaped for the upload JSON's nested `vcs`
     sub-object. Matches what the Android Gradle plugin emits so the
-    appserver persists both identically. Keys (any / all may be
+    back-end persists both identically. Keys (any / all may be
     absent):
 
         commit_sha, base_sha, branch, base_branch, pr_number,
@@ -454,7 +465,7 @@ def resolve_vcs_metadata(working_dir):
 
 def _set_if_present(out, key, value):
     """Only write a field when its value is a non-empty string.
-    Keeps the JSON payload clean — the appserver distinguishes
+    Keeps the JSON payload clean — the back-end distinguishes
     "unknown" from "known empty" by field presence."""
     if value and str(value).strip():
         out[key] = str(value).strip()
@@ -770,7 +781,7 @@ _IPA_FIXED_MTIME = (1980, 1, 1, 0, 0, 0)
 def package_app_as_ipa(app_path, output_ipa_path):
     """Zips `<App>.app` as `Payload/<App>.app/...` into an .ipa file.
 
-    The worker's IPA analyser (`_analyze_bundle` in the worker) walks
+    The back-end's IPA analyser (`_analyze_bundle` in the back-end) walks
     `Payload/*.app` — the very structure Apple's real .ipa uses. We
     produce the same layout minus the code-signing + iTunesMetadata
     that only App Store Connect needs; size analysis runs off the
@@ -779,12 +790,12 @@ def package_app_as_ipa(app_path, output_ipa_path):
 
     DEFLATE for text/plists, STORE (no recompression) for already-
     compressed assets. Matches real App Store IPAs byte-for-byte
-    enough that the worker's categorization heuristics behave
+    enough that the back-end's categorization heuristics behave
     identically.
 
     Normalisation — entry order is sorted ASCII and mtime is pinned to
     a fixed value — so two archives of the same source tree hash
-    identically. Matters because the worker may dedup by content
+    identically. Matters because the back-end may dedup by content
     hash on re-upload.
     """
     with zipfile.ZipFile(output_ipa_path, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -813,7 +824,7 @@ def package_app_as_ipa(app_path, output_ipa_path):
                 info.compress_type = method
                 # Preserve POSIX executable bits on the embedded
                 # Mach-O — otherwise the archive would encode as
-                # plain data and the worker's executable-detection
+                # plain data and the back-end's executable-detection
                 # heuristics (e.g. "is this the main binary?") lose
                 # a signal.
                 try:
@@ -838,7 +849,89 @@ def _mask_token(token):
     return (token[:6] + '…') if len(token) > 6 else '…'
 
 
-def upload_build(endpoint, app_token, ipa_path, payload, debug=False):
+def _put_dependencies_blob(url, gz_bytes, debug=False):
+    """Best-effort PUT of the gzipped dependency blob to the presigned
+    `dependencies_upload_endpoint` the metadata POST returned.
+
+    Independent of the artefact upload — it runs on the build-info-only
+    path too (deps + vuln-scan are part of build-info, not gated on
+    size analysis). Never raises: a failed deps PUT degrades to "no
+    vuln-scan / dependency-diff for this build" and must not break the
+    user's archive flow. Returns True on a 2xx, False otherwise.
+
+    `Content-Type` is hard-set to `application/octet-stream` because the
+    back-end signs the presigned URL over exactly that value (see
+    `builds.service.js` `dependencies_upload_endpoint` signing) — S3
+    403s the PUT on any Content-Type mismatch.
+    """
+    if not url or not gz_bytes:
+        return False
+    try:
+        put_req = urllib.request.Request(url, data=gz_bytes, method='PUT')
+        # Precise Content-Length so the signed request body-length
+        # matches; chunked transfer-encoding breaks S3 presigned PUTs.
+        put_req.add_header('Content-Length', str(len(gz_bytes)))
+        put_req.add_header('Content-Type', 'application/octet-stream')
+        with urllib.request.urlopen(put_req, timeout=120) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        print("Bugsee: dependencies PUT failed (HTTP %d)" % e.code)
+        return False
+    except Exception as e:
+        print("Bugsee: dependencies PUT network error: %s" % e)
+        return False
+
+    if 200 <= status < 300:
+        if debug:
+            print("Bugsee: dependencies blob uploaded (%d bytes, HTTP %d)"
+                  % (len(gz_bytes), status))
+        return True
+    print("Bugsee: dependencies PUT unexpected status: %d" % status)
+    return False
+
+
+def _put_timings_blob(url, gz_bytes, debug=False):
+    """Best-effort PUT of the gzipped per-task timeline DETAIL blob to
+    the presigned `timings_upload_endpoint` the metadata POST returned.
+
+    Mirrors `_put_dependencies_blob` exactly — independent of the
+    artefact upload, runs on the build-info-only path too, never
+    raises (a failed PUT degrades to "no Gantt chart for this build"
+    and must not break the user's archive flow). Returns True on a
+    2xx, False otherwise.
+
+    `Content-Type` is hard-set to `application/octet-stream` because
+    the back-end signs the presigned URL over exactly that value —
+    S3 403s the PUT on any Content-Type mismatch.
+    """
+    if not url or not gz_bytes:
+        return False
+    try:
+        put_req = urllib.request.Request(url, data=gz_bytes, method='PUT')
+        # Precise Content-Length so the signed request body-length
+        # matches; chunked transfer-encoding breaks S3 presigned PUTs.
+        put_req.add_header('Content-Length', str(len(gz_bytes)))
+        put_req.add_header('Content-Type', 'application/octet-stream')
+        with urllib.request.urlopen(put_req, timeout=120) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        print("Bugsee: timings PUT failed (HTTP %d)" % e.code)
+        return False
+    except Exception as e:
+        print("Bugsee: timings PUT network error: %s" % e)
+        return False
+
+    if 200 <= status < 300:
+        if debug:
+            print("Bugsee: timings blob uploaded (%d bytes, HTTP %d)"
+                  % (len(gz_bytes), status))
+        return True
+    print("Bugsee: timings PUT unexpected status: %d" % status)
+    return False
+
+
+def upload_build(endpoint, app_token, ipa_path, payload, debug=False, deps_gz=None,
+                 timings_gz=None):
     """Two-stage upload matching the Android Gradle plugin's
     `BundleUploader.uploadData` semantics exactly:
 
@@ -889,7 +982,7 @@ def upload_build(endpoint, app_token, ipa_path, payload, debug=False):
         print("Bugsee: build create non-JSON response: %s" % raw[:300])
         return False
 
-    # The appserver wraps most responses in `{"ok": true, "result": …}`.
+    # The back-end wraps most responses in `{"ok": true, "result": …}`.
     # Fall back to the bare body when the `result` key isn't present
     # (some routes return the object directly).
     result = parsed.get('result') if isinstance(parsed, dict) else None
@@ -898,6 +991,31 @@ def upload_build(endpoint, app_token, ipa_path, payload, debug=False):
 
     presigned = (result or {}).get('endpoint') if isinstance(result, dict) else None
     requested_artifact_upload = bool(payload.get('request_artifact_upload'))
+
+    # Dependency blob — independent of the artefact. The server signs a
+    # `dependencies_upload_endpoint` whenever the POST carried
+    # `request_dependencies_upload: true`, regardless of whether an
+    # artefact upload was also requested. PUT it here, BEFORE the
+    # build-info-only early-return below, so deps ship on every path
+    # (build-info-only included). Best-effort — never fails the build.
+    if deps_gz:
+        deps_url = (result or {}).get('dependencies_upload_endpoint') if isinstance(result, dict) else None
+        if deps_url:
+            _put_dependencies_blob(deps_url, deps_gz, debug=debug)
+        elif debug:
+            print("Bugsee: deps blob ready but server returned no dependencies_upload_endpoint")
+
+    # Timings detail blob — independent of the artefact, same posture
+    # as the deps blob. The server signs a `timings_upload_endpoint`
+    # whenever the POST carried `request_timings_upload: true`. PUT it
+    # here, BEFORE the build-info-only early-return below, so the Gantt
+    # blob ships on every path (build-info-only included). Best-effort.
+    if timings_gz:
+        timings_url = (result or {}).get('timings_upload_endpoint') if isinstance(result, dict) else None
+        if timings_url:
+            _put_timings_blob(timings_url, timings_gz, debug=debug)
+        elif debug:
+            print("Bugsee: timings blob ready but server returned no timings_upload_endpoint")
 
     # Build-info-only path: the request didn't ask for a presigned URL,
     # so the response carrying just `{ build_id, size_analysis_status }`
@@ -941,7 +1059,7 @@ def upload_build(endpoint, app_token, ipa_path, payload, debug=False):
             put_req.add_header('Content-Length', str(ipa_size))
             # Content-Type matches what a real App Store IPA would be
             # served with; S3 stores the object without caring, the
-            # worker infers format from the zip contents.
+            # back-end infers format from the zip contents.
             put_req.add_header('Content-Type', 'application/octet-stream')
             with urllib.request.urlopen(put_req, timeout=600) as put_resp:
                 status = put_resp.status
@@ -1122,7 +1240,7 @@ def _put_one_chunk(file_path, index, chunk_size, presigned_url):
         try:
             req = urllib.request.Request(presigned_url, data=data, method='PUT')
             # Content-Type must match the server's signing — the
-            # appserver signs with `application/octet-stream` and S3
+            # back-end signs with `application/octet-stream` and S3
             # 403s on a mismatched header. urllib auto-injects a
             # default Content-Type for POST/PUT with bytes data,
             # so this is also a hedge against that.
@@ -1199,9 +1317,10 @@ def _upload_missing_chunks(file_path, chunk_size, all_hashes, missing, upload_ur
 
 def _submit_chunked(endpoint, app_token, payload, hashes):
     """POST the build registration with `chunks: [sha…]`. Returns
-    the server-assigned build_id; raises on any failure shape
-    (HTTP error, non-JSON, missing build_id) so the caller can fall
-    back to single-PUT."""
+    the server `result` dict (carries `build_id` and, when the POST
+    asked for it, `dependencies_upload_endpoint`); raises on any
+    failure shape (HTTP error, non-JSON, missing build_id) so the
+    caller can fall back to single-PUT."""
     url = _chunked_url(endpoint, app_token, '/chunked')
     body_dict = dict(payload)
     # `request_artifact_upload` on the single-PUT path tells the
@@ -1232,14 +1351,15 @@ def _submit_chunked(endpoint, app_token, payload, hashes):
         raise RuntimeError("/builds/chunked returned no result: %s" % raw[:300])
     build_id = result.get('build_id')
     if not build_id:
-        # 2xx without build_id means the worker pipeline has no key
+        # 2xx without build_id means the back-end pipeline has no key
         # to look us up by — fail loud so the caller falls back to
         # single-PUT rather than thinking everything's fine.
         raise RuntimeError("/builds/chunked returned 2xx without build_id: %s" % raw[:300])
-    return build_id
+    return result
 
 
-def try_chunked_upload(endpoint, app_token, ipa_path, payload, debug=False):
+def try_chunked_upload(endpoint, app_token, ipa_path, payload, debug=False, deps_gz=None,
+                       timings_gz=None):
     """Attempt chunked upload of `ipa_path`. Returns True on success,
     False if any phase failed. Does NOT raise — every error path
     prints a diagnostic and returns False so the dispatcher can fall
@@ -1303,10 +1423,34 @@ def try_chunked_upload(endpoint, app_token, ipa_path, payload, debug=False):
             return False
 
     try:
-        build_id = _submit_chunked(endpoint, app_token, payload, hashes)
+        result = _submit_chunked(endpoint, app_token, payload, hashes)
     except Exception as e:
         print("Bugsee: chunked upload — /chunked submit failed: %s" % e)
         return False
+    build_id = result.get('build_id')
+
+    # Dependency blob — PUT only after a successful chunked submit, so
+    # it never double-fires with the single-PUT fallback (on submit
+    # failure we return False above and `upload_build` does its own
+    # metadata POST + deps PUT). Best-effort; a failed deps PUT does
+    # not fail the otherwise-successful chunked artefact upload.
+    if deps_gz:
+        deps_url = result.get('dependencies_upload_endpoint')
+        if deps_url:
+            _put_dependencies_blob(deps_url, deps_gz, debug=debug)
+        elif debug:
+            print("Bugsee: deps blob ready but /chunked returned no dependencies_upload_endpoint")
+
+    # Timings detail blob — same posture as the deps blob: PUT only
+    # after a successful chunked submit so it never double-fires with
+    # the single-PUT fallback. Best-effort; a failed timings PUT does
+    # not fail the otherwise-successful chunked artefact upload.
+    if timings_gz:
+        timings_url = result.get('timings_upload_endpoint')
+        if timings_url:
+            _put_timings_blob(timings_url, timings_gz, debug=debug)
+        elif debug:
+            print("Bugsee: timings blob ready but /chunked returned no timings_upload_endpoint")
 
     # Log the dedup outcome with UNIQUE counts — `missing` from the
     # server may list a duplicate-content sha multiple times (once per
@@ -1330,7 +1474,7 @@ def try_chunked_upload(endpoint, app_token, ipa_path, payload, debug=False):
 #
 # Synchronous companion to the size-analysis upload. After the build's
 # .ipa has been packaged we know its exact byte size; the check fetches
-# the most recent prior build's recorded size from the appserver
+# the most recent prior build's recorded size from the back-end
 # (`/v2/apps/{token}/builds/baseline`) and compares the two against
 # the user-supplied warning + fail thresholds. Crossing a fail
 # threshold prints `error: …` (Xcode's prefix for diagnostics that
@@ -1394,7 +1538,7 @@ def _resolve_size_check_thresholds(env):
 
 
 def _format_bytes(n):
-    """Compact SI-ish renderer that mirrors the viewer's formatter
+    """Compact SI-ish renderer that mirrors the front-end's formatter
     (and the Android plugin's) so one user reads a single set of
     numbers across the whole stack."""
     abs_n = -n if n < 0 else n
@@ -1516,7 +1660,7 @@ def prepare_size_check(endpoint, app_token, package_id, build_configuration, deb
     `upload_build`. That ordering guarantees the lookup never picks up
     the in-flight build as its own baseline — the just-created build
     is in `status='uploading'` (or `'processing'`) and the server's
-    baseline filter requires `status='ready'`, but worker propagation
+    baseline filter requires `status='ready'`, but back-end propagation
     is async so a fast-enough server could in principle promote our
     build before this script's evaluate-side runs. Fetching pre-upload
     eliminates that race entirely without depending on server timing.
@@ -1613,18 +1757,75 @@ def run_size_check(thresholds, baseline, local_size):
 
 
 # -----------------------------------------------------------------
-# Build-timing extraction — minimal xcactivitylog decoder
+# Build-timing extraction — SLF section-tree xcactivitylog decoder
 # -----------------------------------------------------------------
 #
-# Xcode's `.xcactivitylog` files are gzipped SLF-format streams
+# Xcode's `.xcactivitylog` files are gzip of an `SLF0` token stream
 # living in `<DerivedData>/<Project>/Logs/Build/`. The full schema is
 # large and Xcode-version-sensitive — Spotify's XCLogParser is the
-# authoritative reference. This decoder stays deliberately narrow:
-# it extracts only the ROOT section's start/end timestamps so we can
-# report `total_ms`. Per-category breakdown + top-N slowest tasks
-# are deferred to a follow-up change that vendors a proper SLF
-# grammar; shipping just `total_ms` gives meaningful signal with
-# much lower parsing risk.
+# authoritative reference. This decoder tokenizes the stream properly
+# (it does NOT regex-scan for timestamp pairs — that flattens the
+# nested section tree and produces hundreds of phantom parallel bars
+# plus impossible per-category totals) and reconstructs the typed
+# section objects:
+#
+#   SLF0 grammar after the 4-byte `SLF0` header — tokens are
+#   `<ascii-payload><1-byte-delimiter>`:
+#     `"` string, `%` className-def, `*` JSON/data blob — all THREE
+#         are LENGTH-PREFIXED with a DECIMAL length, then that many
+#         raw bytes follow.
+#     `#` int (HEX payload), `^` double (16 hex chars, little-endian
+#         IEEE-754), `@` classRef (hex index into the class table),
+#         `(` array/object (element count), `-` null.
+#   The class table is every `%` def in order, 1-based; `@N`
+#   references the N-th def. Two section classes matter:
+#     `IDEActivityLogSection`           — grouping wrappers (the root
+#                                         build, `Prepare build`,
+#                                         `Run post-actions`, and one
+#                                         `Build target <X>` per target).
+#     `IDEActivityLogCommandInvocationSection` — the actual
+#                                         clang/swiftc/ld/etc. commands.
+#   A section instance starts at an `@`-ref to one of those classes,
+#   immediately followed by `# " " " ^ ^` (sectionType, domainType,
+#   title, signature, timeStarted, timeStopped) then a subSections
+#   field that is `(N` (array of N children) or `-` (none). We extract
+#   (class, title, start, end) from each. Timestamps are CFAbsoluteTime
+#   (seconds since 2001-01-01); add `_CF_ABSOLUTE_TIME_EPOCH_OFFSET`
+#   and ×1000 for Unix-epoch ms.
+#
+# From the extracted sections we derive:
+#
+#   - `total_ms`      — the build's wall-clock SPAN (`max(end) −
+#                       min(start)` across ALL sections), mirroring
+#                       Android's `wall_clock_ms = latestEnd −
+#                       earliestStart`.
+#   - `category_sums` — per-category OCCUPANCY (the union-of-intervals
+#                       length, NOT the sum) over the COMMAND-invocation
+#                       sections, classified by title. Occupancy can
+#                       never exceed wall-clock. The old flat code
+#                       SUMMED per-file Swift batch windows, inflating
+#                       `native` to ~1054s on a 20s/14-core build
+#                       (Swift compiles many files per frontend process
+#                       and Xcode replicates the batch's wall-clock
+#                       window onto every file's command section).
+#   - `top_tasks`     — the slowest `Build target ` groupings (name +
+#                       duration_ms), capped at `_XCACTIVITYLOG_TOP_N`.
+#   - a TIMELINE      — one `{path, category, start_ms, end_ms}` row
+#                       per `Build target ` grouping (offsets from the
+#                       build start), gzipped and PUT to the
+#                       `timings_upload_endpoint` for Gantt-chart parity
+#                       with the Android Gradle plugin's `timings.json`.
+#                       The mega-wrappers (root build / `Prepare build`
+#                       / `Run post-actions` / `Prepare packages`) are
+#                       EXCLUDED — they span the whole build. Each
+#                       target's `category` is its DOMINANT category:
+#                       the category with the greatest command-occupancy
+#                       among command-invocations contained within the
+#                       target's window.
+#
+# `total_ms` + `category_sums` + `top_tasks` feed the inline
+# `build_metadata.timings` summary on the build POST body; the timeline
+# is the lazily-fetched detail blob.
 #
 # When any step fails the function returns None and the caller simply
 # omits the `timings` field — size-analysis payloads without timings
@@ -1644,47 +1845,54 @@ _XCACTIVITYLOG_MAX_DECOMPRESSED = 20 * 1024 * 1024
 
 # Cap for the `top_tasks` list sent in `build_metadata.timings` — the
 # server sanitizer caps at 50, plugin default is 10 to match Android.
+# `top_tasks` now lists the slowest `Build target ` groupings (the
+# Gantt level), not per-file leaves whose durations were batch-inflated.
 _XCACTIVITYLOG_TOP_N = 10
 
-# Timestamps in the SLF stream are written as little-endian IEEE-754
-# doubles, hex-encoded (16 lowercase hex characters, no separator).
-# Section boundaries always place `startTime` and `endTime` adjacent
-# and separated only by a nil (`^`) marker. Matching that compound
-# shape in one regex avoids false positives from hex runs that appear
-# inside titles / JSON payloads / UUIDs.
-_SLF_SECTION_TIMESTAMPS_RE = re.compile(
-    rb'(?<![0-9a-f])([0-9a-f]{16})\^([0-9a-f]{16})\^'
-)
+# Wire-format schema version for the per-task timeline DETAIL blob (the
+# gzipped JSON PUT to `timings_upload_endpoint`). Kept in lockstep with
+# the Android Gradle plugin's `TimingsPayloadSerializer.SCHEMA_VERSION`
+# and the back-end's `_SUPPORTED_SCHEMA_VERSIONS` set — both currently 1.
+_TIMELINE_SCHEMA_VERSION = 1
 
-# Title prefixes we exclude from the `top_tasks` list AND from
-# per-category sums because they're container / wrapper sections
-# whose duration is the sum of their children — keeping them would
-# make the top-10 look like "Build X 18s, Build target X 18s, …",
-# crowding out the actual slow work, and would massively inflate
-# any category they land in.
-# Scoped to specific known wrappers so that genuinely-slow leaf
-# tasks whose titles merely happen to start with a common verb
-# ("Compile asset catalogs" is an opaque leaf, for example) still
-# surface.
-_XCACTIVITYLOG_WRAPPER_PREFIXES = (
-    'Build ',           # "Build <target>" — whole-target wrapper
-    'Build target ',    # "Build target <name>" — inner wrapper
-    'Compiling ',       # "Compiling X.swift[, Y.swift]" — groups per-arch compiles
-    'Prepare ',         # build-system preparation wrappers
-    'Create build ',    # XCBuild wrappers
-    'Send project ',    # XCBuild wrapper (project description)
-    'Clean ',           # "Clean <target>" — clean wrapper
-    'Workspace ',       # workspace-level wrapper
-    'SchemeAction ',    # pre/post-action wrappers
-    'Run pre-actions',
-    'Run post-actions',
-)
+# Maximum number of task records emitted in the timeline blob. Mirrors
+# Android's `TimingsPayloadSerializer.MAX_TASKS`. The Gantt now emits
+# one row per `Build target ` grouping (~26 on a typical workspace), so
+# this cap is effectively never hit; it remains a guard against a
+# pathological workspace with tens of thousands of targets. When the
+# cap IS exceeded we keep the SLOWEST targets (see `_build_timeline_blob`).
+_TIMELINE_MAX_TASKS = 10000
+
+# Title prefix marking the per-target grouping sections that become
+# both the Gantt rows and the `top_tasks` entries. The mega-wrappers
+# (the root `Build <scheme>`, `Prepare build`, `Run post-actions`,
+# `Prepare packages`) do NOT carry this prefix and so are excluded —
+# they span the whole build and would draw a single bar covering the
+# entire timeline.
+_XCACTIVITYLOG_TARGET_PREFIX = 'Build target '
+
+# The two SLF section classes we extract. Grouping wrappers (root
+# build, `Prepare build`, `Run post-actions`, `Build target <X>`) are
+# `IDEActivityLogSection`; the actual clang/swiftc/ld/etc. commands are
+# `IDEActivityLogCommandInvocationSection`.
+_SLF_SECTION_CLASS = 'IDEActivityLogSection'
+_SLF_COMMAND_CLASS = 'IDEActivityLogCommandInvocationSection'
+_SLF_SECTION_CLASSES = frozenset((_SLF_SECTION_CLASS, _SLF_COMMAND_CLASS))
+
+# SLF token delimiters. The three LENGTH-PREFIXED forms (`"` string,
+# `%` className-def, `*` JSON/data blob) carry a DECIMAL length whose
+# raw bytes follow; the rest are SIMPLE (`#` hex int, `^` hex double,
+# `@` hex classRef, `(` array/object element count, `-` null).
+_SLF_LEN_PREFIXED = b'"%*'
+_SLF_SIMPLE = b'#^@(-'
+_SLF_DELIMS = frozenset(_SLF_LEN_PREFIXED + _SLF_SIMPLE)
+_SLF_LEN_PREFIXED_SET = frozenset(_SLF_LEN_PREFIXED)
 
 
 # Per-category title classifier for iOS build events. Wire shape is
 # the same as the Android Gradle plugin's (`managed_code_ms` /
 # `native_ms` / `resources_ms` / `packaging_ms` / `other_ms`) so
-# appserver + viewer render both platforms from a single schema.
+# back-end + front-end render both platforms from a single schema.
 # Semantic mapping for iOS:
 #
 #   managed_code_ms → never emitted on iOS. Reserved for JVM-
@@ -1732,6 +1940,9 @@ _XCACTIVITYLOG_CATEGORY_NATIVE_PATTERNS = (
     re.compile(r'^SwiftVerifyEmittedModuleInterface\b'),
     re.compile(r'^Generate Swift Constant Values\b'),
     # Explicit module / Clang module builds pulled into Swift.
+    # NOTE: `^Compiling Clang module` is also special-cased in
+    # `_classify_section_title` ahead of the wrapper check — the
+    # `Compiling ` wrapper prefix would otherwise intercept it.
     re.compile(r'^Compiling Clang module\b'),
     re.compile(r'^Precompile module\b'),
     re.compile(r'^Explicitly Built\b'),
@@ -1812,6 +2023,19 @@ def _find_latest_xcactivitylog(obj_root):
     "Newest" is resolved by mtime — Xcode writes one log file per
     build/archive, so the most-recently-modified one in `Logs/Build/`
     corresponds to the archive we're currently running under.
+
+    TODO(timings): Multi-arch archives (Mac Catalyst, iOS + macOS
+    targets in one workspace) can place the relevant log in a sibling
+    `Logs/Build/` directory we don't search. The current
+    newest-mtime-in-the-discovered-dir strategy is deterministic but
+    may pick the wrong arch's log on such projects. Cross-directory
+    search deferred.
+
+    TODO(timings): Stale-log detection — if the newest `.xcactivitylog`
+    was written before the current build started, we'd report
+    pre-build numbers as if they were this build's. No retry / warning
+    is emitted today; consider checking the file's mtime against
+    `os.environ.get('BUILD_TIMESTAMP')` or similar before parsing.
     """
     dd_root = _find_derived_data_root(obj_root)
     if not dd_root:
@@ -1840,125 +2064,182 @@ def _find_latest_xcactivitylog(obj_root):
     return entries[0]
 
 
-def _parse_hex_double(hex_bytes):
-    """Decode a 16-char lowercase-hex representation of a little-endian
-    IEEE-754 double back to its float value. Returns None on malformed
-    input so callers can filter garbage silently."""
-    try:
-        return struct.unpack('<d', bytes.fromhex(hex_bytes.decode('ascii')))[0]
-    except Exception:
-        return None
+def _tokenize_slf(data):
+    """Tokenize an `SLF0` byte stream into a flat `[(type, value), …]`
+    list. `data` is the DECOMPRESSED stream (the leading 4-byte `SLF0`
+    header is skipped here).
 
+    Each token is `<ascii-payload><1-byte-delimiter>`:
+      - `"` / `%` / `*` are LENGTH-PREFIXED: the payload is a DECIMAL
+        length, then that many raw bytes follow and become the token's
+        value (decoded as UTF-8, replacement on error). The single
+        nastiest bug here is that the length is DECIMAL, NOT hex, and
+        that `*` (JSON/data blob) MUST consume its length in bytes or
+        the whole stream desyncs.
+      - `^` is a double: 16 hex chars, little-endian IEEE-754. Value is
+        the float, or None if malformed.
+      - `#` / `@` are ints: HEX payload. `#` is a plain int, `@` is a
+        1-based class-table reference. Value is the parsed int.
+      - `(` is an array/object header: HEX payload is the element
+        count. Value is that int.
+      - `-` is null. Value is None.
 
-def _walk_back_to_title(data, end_pos):
-    """Given the position of a section's `<startHex>^<endHex>^`
-    timestamp block, walk the bytes backward to find the section's
-    title string.
-
-    SLF serialises sections as `<titleLen>"<title><detailLen>"<detail>
-    <startHex>^<endHex>^...`. We first find the nearest `"` before
-    `end_pos` (that's the opening of `titleDetail`), then rewind past
-    titleDetail to find the earlier `"` that opens `title`. When
-    that second walk-back fails (the section only has a title — no
-    distinct detail), we fall back to whatever single string we did
-    find.
-
-    Returns the decoded title string, or None when no sensible
-    length-prefixed string is discernible.
+    Returns `(tokens, desync_count)`. `desync_count` is the number of
+    malformed length/number payloads encountered — non-zero hints the
+    grammar drifted, but parsing continues best-effort.
     """
-    # Step 1 — find titleDetail's containing `"` (or title's if the
-    # section has only one string field).
-    cursor = end_pos - 1
-    max_back = 2000
-    while cursor >= 0 and data[cursor:cursor + 1] != b'"':
-        cursor -= 1
-        if end_pos - cursor > max_back:
-            return None
-    if cursor < 0:
+    tokens = []
+    desync = 0
+    i = 4  # skip the 4-byte 'SLF0' header
+    n = len(data)
+    payload = bytearray()
+    while i < n:
+        b = data[i]
+        if b in _SLF_DELIMS:
+            t = chr(b)
+            p = payload.decode('ascii', 'replace')
+            payload = bytearray()
+            i += 1
+            if b in _SLF_LEN_PREFIXED_SET:
+                # DECIMAL length, then that many raw bytes.
+                try:
+                    ln = int(p, 10) if p else 0
+                except ValueError:
+                    ln = 0
+                    desync += 1
+                tokens.append((t, data[i:i + ln].decode('utf-8', 'replace')))
+                i += ln
+            elif t == '^':
+                if len(p) == 16:
+                    try:
+                        tokens.append((t, struct.unpack('<d', bytes.fromhex(p))[0]))
+                    except Exception:
+                        tokens.append((t, None))
+                        desync += 1
+                else:
+                    tokens.append((t, None))
+            else:
+                # '#', '@', '(' carry a HEX payload; '-' carries none.
+                try:
+                    tokens.append((t, int(p, 16) if p else 0))
+                except ValueError:
+                    tokens.append((t, None))
+                    desync += 1
+        else:
+            payload.append(b)
+            i += 1
+    return tokens, desync
+
+
+def _extract_slf_sections(tokens):
+    """Walk a tokenized SLF stream and extract every section instance
+    as a `(cls, title, start_cf, end_cf)` tuple.
+
+    The class table is every `%` className-def in stream order, 1-based;
+    an `@N` token references the N-th def. A section instance starts at
+    an `@`-ref to one of the two section classes, immediately followed
+    by tokens of types `# " " " ^ ^` (sectionType, domainType, title,
+    signature, timeStarted, timeStopped) and then a subSections field
+    that is `(` (array) or `-` (none). We read:
+      - `cls`      — the referenced class name.
+      - `title`    — the 3rd string (index +3).
+      - `start_cf` — the 1st double (index +5), CFAbsoluteTime seconds.
+      - `end_cf`   — the 2nd double (index +6), CFAbsoluteTime seconds.
+
+    Sections with a missing / non-finite / inverted timestamp pair are
+    dropped (they can't contribute to span, occupancy, or the Gantt).
+
+    No tree reconstruction is attempted: containment is resolved later
+    by interval math, which is robust to the subSection-count drift
+    that an explicit child-count stack walk is prone to on real logs.
+    """
+    class_table = [v for (t, v) in tokens if t == '%']
+    ntok = len(tokens)
+
+    def class_of(idx):
+        if isinstance(idx, int) and 1 <= idx <= len(class_table):
+            return class_table[idx - 1]
         return None
 
-    length_end = cursor
-    length_start = length_end
-    # Explicit ASCII-digit byte check — `chr(byte).isdigit()` also
-    # accepts non-ASCII Unicode digits (Arabic-Indic `٠–٩`, superscripts
-    # like `²`), which on stray high-byte runs would over-consume into
-    # binary territory and only fail much later at `int()` parsing.
-    while length_start > 0 and 0x30 <= data[length_start - 1] <= 0x39:
-        length_start -= 1
-    if length_start == length_end:
-        return None
-    try:
-        stated_len = int(data[length_start:length_end])
-    except ValueError:
-        return None
-    content_start = cursor + 1
-    content_end = content_start + stated_len
-    if content_end > end_pos:
-        return None
-    title_detail = data[content_start:content_end].decode('utf-8', errors='replace')
-
-    # Step 2 — rewind past titleDetail's own length prefix to look
-    # for the earlier title string. The title, if present, ends
-    # exactly where titleDetail's length prefix begins.
-    cursor2 = length_start - 1
-    while cursor2 >= 0 and data[cursor2:cursor2 + 1] != b'"':
-        cursor2 -= 1
-        if length_start - cursor2 > max_back:
-            return title_detail
-    if cursor2 < 0:
-        return title_detail
-
-    length_end2 = cursor2
-    length_start2 = length_end2
-    while length_start2 > 0 and 0x30 <= data[length_start2 - 1] <= 0x39:
-        length_start2 -= 1
-    if length_start2 == length_end2:
-        return title_detail
-    try:
-        stated_len2 = int(data[length_start2:length_end2])
-    except ValueError:
-        return title_detail
-
-    cs2 = cursor2 + 1
-    ce2 = cs2 + stated_len2
-    # Only accept the outer title when its stated length lands us
-    # exactly at titleDetail's length-prefix start — otherwise we'd
-    # be reading unrelated earlier bytes as a title.
-    if ce2 != length_start:
-        return title_detail
-    return data[cs2:ce2].decode('utf-8', errors='replace')
+    sections = []
+    for k in range(ntok - 7):
+        t, v = tokens[k]
+        if t != '@':
+            continue
+        cls = class_of(v)
+        if cls not in _SLF_SECTION_CLASSES:
+            continue
+        # Shape check: # " " " ^ ^ then ( or - .
+        if (tokens[k + 1][0] != '#' or tokens[k + 2][0] != '"'
+                or tokens[k + 3][0] != '"' or tokens[k + 4][0] != '"'
+                or tokens[k + 5][0] != '^' or tokens[k + 6][0] != '^'
+                or tokens[k + 7][0] not in ('(', '-')):
+            continue
+        title = tokens[k + 3][1]
+        start_cf = tokens[k + 5][1]
+        end_cf = tokens[k + 6][1]
+        if start_cf is None or end_cf is None:
+            continue
+        if not (math.isfinite(start_cf) and math.isfinite(end_cf)):
+            continue
+        if end_cf < start_cf:
+            continue
+        sections.append((cls, title, start_cf, end_cf))
+    return sections
 
 
-def _is_wrapper_title(title):
-    """True when a section title is a known container / parent wrapper
-    whose duration double-counts its children. Filtered out of
-    `top_tasks` AND per-category sums so aggregates reflect real
-    work rather than the enclosing build-target envelope."""
-    if not title:
-        return True
-    for prefix in _XCACTIVITYLOG_WRAPPER_PREFIXES:
-        if title.startswith(prefix):
-            return True
-    return False
+def _interval_union_seconds(intervals):
+    """Total length (seconds) of the UNION of `[start, end]` intervals
+    — the OCCUPANCY metric. Overlapping windows are merged, so the
+    result can never exceed wall-clock. This is the fix for the flat
+    code's per-category SUM, which double-counted Swift batch windows
+    replicated onto every file's command section.
+
+    `intervals` is an iterable of `(start, end)` float pairs (any
+    order). Returns 0.0 for an empty input.
+    """
+    ordered = sorted(intervals)
+    total = 0.0
+    cur_start = cur_end = None
+    for s, e in ordered:
+        if cur_start is None:
+            cur_start, cur_end = s, e
+        elif s <= cur_end:
+            if e > cur_end:
+                cur_end = e
+        else:
+            total += cur_end - cur_start
+            cur_start, cur_end = s, e
+    if cur_start is not None:
+        total += cur_end - cur_start
+    return total
 
 
 def _classify_section_title(title):
-    """Map an xcactivitylog section title to one of the cross-platform
-    category buckets: `'native'`, `'resources'`, `'packaging'`,
-    `'other'`. (iOS never emits `'managed_code'` — see the mapping
-    docstring above the pattern tuples.) Returns `None` for wrapper
-    titles so callers know to skip the section entirely. Precedence-
-    ordered regex scan — first match wins.
+    """Map a command-invocation section title to one of the cross-
+    platform category buckets: `'native'`, `'resources'`,
+    `'packaging'`, `'other'`. (iOS never emits `'managed_code'` — see
+    the mapping docstring above the pattern tuples.) Returns `None`
+    only for an empty title. Precedence-ordered regex scan — first
+    match wins.
 
-    Pattern-based rather than tree-based, so parallel task durations
-    can sum to more than wall-clock `total_ms`. That's expected on
-    real iOS builds (asset catalogs run in parallel with Swift
-    compiles). Downstream renderers (the viewer) use `max(total, sum)`
-    as the percent denominator to render a meaningful stacked bar
-    in that case — see elements-build-metadata.component.ts.
+    Callers pass COMMAND-invocation titles (`IDEActivityLogCommand-
+    InvocationSection`), never the grouping wrappers, so there is no
+    longer a wrapper-title escape hatch here: the SLF section-tree
+    walk already separates the two classes, and per-category OCCUPANCY
+    (interval union over command sections) is what feeds the chips,
+    so a parallel build's occupancy can never exceed wall-clock
+    `total_ms`. The dominant-category logic in `_build_timeline_blob`
+    reuses this same classifier on the commands contained within each
+    target window.
     """
-    if not title or _is_wrapper_title(title):
+    if not title:
         return None
+    # `Compiling Clang module <name>` is a real native compile event
+    # (explicit module build); list it ahead of the generic patterns
+    # so it lands in `native` rather than `other`.
+    if title.startswith('Compiling Clang module'):
+        return 'native'
     for p in _XCACTIVITYLOG_CATEGORY_NATIVE_PATTERNS:
         if p.match(title):
             return 'native'
@@ -1971,19 +2252,212 @@ def _classify_section_title(title):
     return 'other'
 
 
+# `/Users/<name>` matches the username token regardless of what
+# follows. Earlier we anchored on `(?=/|$)` so the lookahead would
+# require either a path separator or end-of-string — but Xcode
+# occasionally embeds bare user-home references in the middle of
+# titles (e.g. `"warning at /Users/alice and exit"`), and the
+# anchored form let the username slip past, where the catch-all
+# `_ABSOLUTE_PATH_RE` then reduced `/Users/alice` to basename
+# `alice` — emitting the bare username as a standalone word.
+#
+# Username character class is restricted to `[A-Za-z0-9._\-]+` (the
+# realistic Unix-username surface) rather than `[^/\s]+`. The broader
+# negation would also consume trailing punctuation (`,`, `)`, `:`,
+# `;`, `.`) when the username appears mid-title, producing slightly
+# mangled surrounding text in the emitted name. The narrower class
+# stops at the first non-username character so the surrounding
+# sentence preserves its shape (`"see /Users/alice)"` →
+# `"see <home>)"`, not `"see <home>"`).
+_PATH_USER_HOME_RE = re.compile(r'/Users/[A-Za-z0-9._\-]+')
+_PATH_PRIVATE_VAR_FOLDERS_RE = re.compile(
+    r'/private/var/folders/[^\s]+'
+)
+_ABSOLUTE_PATH_RE = re.compile(r'(?<!\S)(/[^\s]+)')
+
+
+def _sanitize_section_title_for_emission(title):
+    """Strip PII (username, machine-local paths) out of an xcactivitylog
+    section title before it ships in `top_tasks`.
+
+    Xcode often embeds absolute paths in section titles (e.g.
+    `Compile /Users/alice/Projects/MyApp/Sources/Foo.swift`). We:
+      - replace `/Users/<name>/` with `<home>/` (drops the username),
+      - collapse `/private/var/folders/...` paths to their basename
+        (TemporaryItems / DerivedData scratch paths leak machine UUIDs),
+      - reduce any other absolute path token to its basename.
+    Non-path tokens pass through unchanged so titles like
+    `Compile Foo.swift (arm64)` are emitted verbatim.
+    """
+    if not title:
+        return title
+
+    def _replace_user_home(m):
+        return '<home>'
+
+    def _replace_private_var(m):
+        return os.path.basename(m.group(0))
+
+    def _replace_absolute(m):
+        path = m.group(1)
+        if path.startswith('<home>'):
+            return path
+        return os.path.basename(path) or path
+
+    sanitized = _PATH_USER_HOME_RE.sub(_replace_user_home, title)
+    sanitized = _PATH_PRIVATE_VAR_FOLDERS_RE.sub(_replace_private_var, sanitized)
+    sanitized = _ABSOLUTE_PATH_RE.sub(_replace_absolute, sanitized)
+    return sanitized
+
+
+def _dominant_category_for_window(commands, win_start, win_end):
+    """Return the DOMINANT category for a target window — the category
+    with the greatest command-OCCUPANCY (interval union, not sum) among
+    the command-invocations whose `[start, end]` is CONTAINED within
+    `[win_start, win_end]`.
+
+    Containment (rather than overlap) keeps each command attributed to
+    exactly the target it belongs to; a command that straddles a target
+    boundary (rare, and usually a build-system bookkeeping section) is
+    simply not counted toward that target's category.
+
+    `commands` is a list of `(category, start_cf, end_cf)` tuples for
+    every classified command-invocation in the build. Returns `'native'`
+    when the window contains no classifiable command (a target made up
+    of only build-graph bookkeeping still renders as a native bar rather
+    than vanishing).
+    """
+    by_cat = {}
+    for cat, s, e in commands:
+        if s >= win_start and e <= win_end:
+            by_cat.setdefault(cat, []).append((s, e))
+    if not by_cat:
+        return 'native'
+    best_cat = 'native'
+    best_occ = -1.0
+    for cat, intervals in by_cat.items():
+        occ = _interval_union_seconds(intervals)
+        if occ > best_occ:
+            best_occ = occ
+            best_cat = cat
+    return best_cat
+
+
+def _build_timeline_blob(targets, build_start_cf):
+    """Build the Gantt-chart DETAIL blob from the per-target grouping
+    records. `targets` is a list of `(path, category, start_cf, end_cf)`
+    tuples — one per `Build target ` grouping, with `category` already
+    resolved to the target's DOMINANT command-category — and
+    `build_start_cf` is the build's earliest section start in
+    CFAbsoluteTime.
+
+    Wire shape (unchanged from the flat implementation, and mirroring
+    the Android Gradle plugin's `TimingsPayloadSerializer` so back-end
+    + front-end render both platforms from one schema):
+
+      { "schema_version": 1,
+        "build_started_at_ms": <epoch ms of build start>,
+        "wall_clock_ms": <max end − min start over targets, ms>,
+        "tasks": [ {"path", "category", "start_ms", "end_ms"}, … ] }
+
+    Rules:
+      - `start_ms`/`end_ms` are OFFSETS from `build_started_at_ms`
+        (not absolute), in ms.
+      - tasks sorted by `start_ms` ascending.
+      - capped at `_TIMELINE_MAX_TASKS`; when truncating we keep the
+        SLOWEST targets, then re-sort the kept slice by start.
+
+    Unlike the old code, the rows are the per-target GROUPINGS — NOT
+    per-file leaf sections — so the Gantt shows ~one bar per target
+    (low-double-digit peak concurrency) rather than 300+ phantom
+    parallel bars. The mega-wrappers (root build / `Prepare build` /
+    `Run post-actions` / `Prepare packages`) were already filtered out
+    by the caller.
+
+    Returns the blob dict, or None when there are no target groupings —
+    callers then PUT nothing.
+    """
+    if not targets:
+        return None
+
+    # `build_started_at_ms` is anchored to the WHOLE build's start (the
+    # earliest section of any class), so per-target offsets are relative
+    # to t0 of the build, not to the earliest target.
+    build_started_at_ms = int(round(
+        (build_start_cf + _CF_ABSOLUTE_TIME_EPOCH_OFFSET) * 1000))
+    latest_end_cf = max(e for _p, _c, _s, e in targets)
+    wall_clock_ms = max(0, int(round((latest_end_cf - build_start_cf) * 1000)))
+
+    # Truncation keeps the SLOWEST targets (sort by duration desc,
+    # slice), then re-sorts the kept slice chronologically so the array
+    # reads start-ordered for the front-end's greedy-lane Gantt packer.
+    if len(targets) > _TIMELINE_MAX_TASKS:
+        print(
+            "Bugsee: build-timings detail blob truncated "
+            "(%d targets -> %d slowest kept)"
+            % (len(targets), _TIMELINE_MAX_TASKS)
+        )
+        kept = sorted(
+            targets, key=lambda t: t[3] - t[2], reverse=True
+        )[:_TIMELINE_MAX_TASKS]
+    else:
+        kept = targets
+
+    tasks = [
+        {
+            'path': _sanitize_section_title_for_emission(path)[:255],
+            'category': category,
+            'start_ms': int(round((start_cf - build_start_cf) * 1000)),
+            'end_ms': int(round((end_cf - build_start_cf) * 1000)),
+        }
+        for path, category, start_cf, end_cf in sorted(kept, key=lambda t: t[2])
+    ]
+
+    return {
+        'schema_version': _TIMELINE_SCHEMA_VERSION,
+        'build_started_at_ms': build_started_at_ms,
+        'wall_clock_ms': wall_clock_ms,
+        'tasks': tasks,
+    }
+
+
+def _timeline_blob_gz(blob):
+    """Gzip the compact JSON timeline blob, mirroring `_deps_blob_gz`
+    (compact separators, `gzip.compress`). Shape matches the Android
+    Gradle plugin's `TimingsPayloadSerializer.gzipBytes`."""
+    raw = json.dumps(blob, separators=(',', ':')).encode('utf-8')
+    return gzip.compress(raw)
+
+
 def _parse_xcactivitylog(log_path):
-    """Extract the build's wall-clock duration AND a top-N slowest-
-    sections list from an `.xcactivitylog`.
+    """Extract the build's wall-clock span, per-category OCCUPANCY, a
+    top-N slowest-targets list, AND a per-target Gantt timeline from an
+    `.xcactivitylog`, using a proper SLF section-tree decode.
 
-    Returns a dict with:
-      - `total_ms`: root section wall-clock, or None if not found.
-      - `top_tasks`: up to `_XCACTIVITYLOG_TOP_N` entries of the form
-        `{"name": <title>, "duration_ms": <int>}`, non-wrapper
-        sections ordered by duration descending.
+    Pipeline:
+      1. Decompress + `_tokenize_slf` the `SLF0` stream.
+      2. `_extract_slf_sections` → every `(cls, title, start, end)`
+         section instance, split into the two section classes.
+      3. `total_ms`      = wall-clock SPAN (`max(end) − min(start)`)
+                           over ALL sections.
+      4. `category_sums` = per-category OCCUPANCY (interval union) over
+                           the COMMAND-invocation sections, classified
+                           by title. Occupancy can never exceed
+                           wall-clock — the fix for the flat code's
+                           batch-inflated SUMs.
+      5. targets         = the `IDEActivityLogSection` groupings whose
+                           title starts with `Build target ` (the
+                           mega-wrappers are excluded). Each target's
+                           DOMINANT category is the category with the
+                           greatest command-occupancy among commands
+                           contained within its window.
+      6. `top_tasks`     = the slowest targets (name + duration_ms),
+                           capped at `_XCACTIVITYLOG_TOP_N`.
+      7. `timeline`      = the Gantt blob (one row per target).
 
-    When the log can't be opened / decompressed / parsed at all, the
-    whole function returns None and the caller simply omits the
-    `timings` field.
+    Returns a dict with `total_ms` / `top_tasks` / `category_sums` /
+    `timeline`, or None when the log can't be opened / decompressed /
+    tokenized into any section at all.
     """
     try:
         with gzip.open(log_path, 'rb') as g:
@@ -1992,73 +2466,41 @@ def _parse_xcactivitylog(log_path):
         return None
 
     if len(data) > _XCACTIVITYLOG_MAX_DECOMPRESSED:
-        # Truncated to cap memory; timings from a truncated tail
-        # would be missing anyway. Work with what we have — the root
-        # section always lives at the head of the stream.
+        # Truncated to cap memory; a truncated tail loses late sections
+        # anyway. Work with what we have — the class table and the root
+        # section live at the head of the stream.
         data = data[:_XCACTIVITYLOG_MAX_DECOMPRESSED]
 
-    # Collect every `<startHex>^<endHex>^` timestamp pair we see and
-    # associate each with its preceding title. The FIRST pair that
-    # passes all plausibility filters is the root section's
-    # timestamps — that's our `total_ms`. Using "first valid match"
-    # rather than "first regex match at idx 0" matters: if the very
-    # first regex hit fails a filter (implausible stamp, nonsense
-    # duration), we'd otherwise lose the root.
-    sections = []
-    root_duration_ms = None
-    for m in _SLF_SECTION_TIMESTAMPS_RE.finditer(data):
-        start_t = _parse_hex_double(m.group(1))
-        end_t = _parse_hex_double(m.group(2))
-        if start_t is None or end_t is None:
-            continue
-        # CFAbsoluteTime is seconds since 2001; a timestamp under
-        # ~1e8 would predate 2004 and is almost certainly a coincidence
-        # (some random hex sequence that happened to parse). Reject
-        # implausible stamps to keep top-N focused on real build events.
-        if start_t < 1e8 or end_t < start_t:
-            continue
-        duration_ms = int(round((end_t - start_t) * 1000))
-        # 24 hours is more than anyone's Xcode build, and guards
-        # against NaN-ish arithmetic producing an absurd duration.
-        if duration_ms < 0 or duration_ms > 24 * 60 * 60 * 1000:
-            continue
-
-        title = _walk_back_to_title(data, m.start())
-        sections.append((title, duration_ms))
-        if root_duration_ms is None:
-            root_duration_ms = duration_ms
-
+    tokens, _desync = _tokenize_slf(data)
+    sections = _extract_slf_sections(tokens)
     if not sections:
         return None
 
-    # Non-wrapper sections, longest first, capped at TOP_N.
-    leaf_sorted = sorted(
-        ((title, dur) for title, dur in sections if not _is_wrapper_title(title)),
-        key=lambda td: td[1],
-        reverse=True,
-    )
-    # Title length clamp mirrors the server sanitizer's MAX_TASK_NAME_LEN
-    # (255 chars). Concatenated Swift-compile group titles occasionally
-    # get very long ("Compiling A.swift, B.swift, C.swift, …"); clamping
-    # at the source keeps the JSON tidy and rejects nothing the server
-    # would silently truncate anyway.
-    top_tasks = [
-        {'name': title[:255], 'duration_ms': dur}
-        for title, dur in leaf_sorted[:_XCACTIVITYLOG_TOP_N]
-        if dur >= 1  # sub-millisecond entries are noise on any real build
-    ]
+    # total_ms = wall-clock SPAN over ALL sections. CFAbsoluteTime is
+    # seconds since 2001; the span is offset-independent so no epoch
+    # shift is needed here.
+    build_start_cf = min(s for _c, _t, s, _e in sections)
+    build_end_cf = max(e for _c, _t, _s, e in sections)
+    total_ms = max(0, int(round((build_end_cf - build_start_cf) * 1000)))
 
-    # Per-category sums. Wrapper sections are filtered inside
-    # `_classify_section_title`, so the Build / Build-target envelopes
-    # don't land in any bucket. Category sums on a parallel build can
-    # exceed wall-clock `total_ms` — the viewer renders that correctly
-    # via a `max(total, sum)` denominator (see
-    # elements-build-metadata.component.ts).
-    # `managed_code` is a cross-platform bucket that iOS never fills
-    # (Swift / Obj-C / C/C++ all land in `native`), but we keep it
-    # pre-seeded to zero for parity with the Android side — the
-    # emission loop filters out zero-valued buckets so the wire
-    # payload remains tidy.
+    # Classify each COMMAND-invocation once; reused for both the
+    # category-occupancy chips and the per-target dominant category.
+    commands = []
+    for cls, title, s, e in sections:
+        if cls != _SLF_COMMAND_CLASS:
+            continue
+        bucket = _classify_section_title(title)
+        if bucket is None:
+            continue
+        commands.append((bucket, s, e))
+
+    # Per-category OCCUPANCY (interval union per bucket), in ms.
+    # `managed_code` is a cross-platform bucket iOS never fills (Swift /
+    # Obj-C / C/C++ all land in `native`); kept pre-seeded to zero for
+    # parity with Android, and the emission loop drops zero buckets.
+    by_cat_intervals = {}
+    for bucket, s, e in commands:
+        by_cat_intervals.setdefault(bucket, []).append((s, e))
     category_sums = {
         'managed_code': 0,
         'native': 0,
@@ -2066,40 +2508,103 @@ def _parse_xcactivitylog(log_path):
         'packaging': 0,
         'other': 0,
     }
-    for title, duration_ms in sections:
-        bucket = _classify_section_title(title)
-        if bucket is None:
+    for bucket, intervals in by_cat_intervals.items():
+        category_sums[bucket] = int(round(
+            _interval_union_seconds(intervals) * 1000))
+
+    # `Build target ` groupings → the Gantt rows + top_tasks. The four
+    # mega-wrappers (root build, `Prepare build`, `Prepare packages`,
+    # `Run post-actions`) are `IDEActivityLogSection` too but DON'T
+    # carry the `Build target ` prefix, so they're excluded — they span
+    # the whole build and would draw a single full-width bar.
+    targets = []
+    for cls, title, s, e in sections:
+        if cls != _SLF_SECTION_CLASS:
             continue
-        category_sums[bucket] += duration_ms
+        if not title or not title.startswith(_XCACTIVITYLOG_TARGET_PREFIX):
+            continue
+        category = _dominant_category_for_window(commands, s, e)
+        # Strip the `Build target ` prefix for the emitted path.
+        path = title[len(_XCACTIVITYLOG_TARGET_PREFIX):] or title
+        targets.append((path, category, s, e))
+
+    # top_tasks = slowest target groupings, longest first, capped at
+    # TOP_N. Durations here are the target wall-clock windows (NOT
+    # batch-inflated per-file sums).
+    top_sorted = sorted(
+        targets, key=lambda t: t[3] - t[2], reverse=True)
+    top_tasks = []
+    for path, _category, s, e in top_sorted[:_XCACTIVITYLOG_TOP_N]:
+        dur = int(round((e - s) * 1000))
+        if dur < 1:  # sub-millisecond targets are noise
+            continue
+        top_tasks.append({
+            'name': _sanitize_section_title_for_emission(path)[:255],
+            'duration_ms': dur,
+        })
+
+    # Per-target Gantt blob. Offsets are relative to the WHOLE build's
+    # start so the bars line up with the absolute timeline.
+    timeline = _build_timeline_blob(targets, build_start_cf)
 
     return {
-        'total_ms': root_duration_ms,
+        'total_ms': total_ms,
         'top_tasks': top_tasks,
         'category_sums': category_sums,
+        'timeline': timeline,
     }
 
 
 def resolve_build_timings(env):
-    """Produce the `build_metadata.timings` sub-object for the current
-    build, or None when no timing source is available.
+    """Produce the build's timing data for the current build.
 
-    Populates `total_ms` from the root `.xcactivitylog` section, a
-    `top_tasks` list of the slowest non-wrapper sections, and a
-    per-category rollup (`native_ms` / `resources_ms` /
-    `packaging_ms` / `other_ms`) classified by section title. iOS
-    never emits `managed_code_ms` — Swift / Obj-C / C / C++ all
-    compile into the Mach-O and land in `native_ms` on this
-    platform. The server schema shares the field names with Android,
-    which keeps `managed_code_ms` populated (JVM-bytecode
-    compilation: kotlinc / javac / R8 / desugar).
+    Returns a `(timings, timeline_gz)` tuple:
+      - `timings`: the inline `build_metadata.timings` sub-object —
+        `total_ms` (wall-clock SPAN), a `top_tasks` list of the
+        slowest `Build target ` groupings, and a per-category rollup
+        (`native_ms` / `resources_ms` / `packaging_ms` / `other_ms`)
+        whose values are command-invocation OCCUPANCY (interval union,
+        so they never exceed `total_ms`). iOS never emits
+        `managed_code_ms` — Swift / Obj-C / C / C++ all compile into
+        the Mach-O and land in `native_ms`. The server schema shares
+        the field names with Android, which keeps `managed_code_ms`
+        populated (JVM-bytecode compilation: kotlinc / javac / R8 /
+        desugar).
+      - `timeline_gz`: the gzipped per-target Gantt DETAIL blob PUT to
+        the presigned `timings_upload_endpoint` for Gantt-chart parity
+        with Android's `timings.json`, or None when there's no
+        `Build target ` grouping to chart.
+
+    Either element may be None independently. `(None, None)` means no
+    timing source was available at all.
+
+    Wraps the entire pipeline in a broad except so any future parser
+    bug (e.g. an `inf`/`nan` slipping past the section filters and
+    overflowing duration arithmetic, or a malformed SLF stream
+    causing struct/unicode decode errors that weren't anticipated)
+    degrades gracefully to "no timings" instead of escaping into the
+    outer build-publish wrapper. The outer wrapper aborts the entire
+    build-info upload — losing timings is acceptable; losing the
+    build record is not.
     """
+    try:
+        return _resolve_build_timings_impl(env)
+    except Exception as e:
+        print(
+            "Bugsee: build-timings extraction failed (%s) — "
+            "omitting timings from build_metadata" % str(e)
+        )
+        return None, None
+
+
+def _resolve_build_timings_impl(env):
     obj_root = env.get('OBJROOT')
     log_path = _find_latest_xcactivitylog(obj_root)
     if not log_path:
-        return None
+        return None, None
     parsed = _parse_xcactivitylog(log_path)
     if not parsed:
-        return None
+        return None, None
 
     # Server sanitizer drops fields that are falsy / None, but being
     # explicit about omissions keeps the wire payload tidy. Emit
@@ -2114,7 +2619,17 @@ def resolve_build_timings(env):
     for bucket, value in (parsed.get('category_sums') or {}).items():
         if value > 0:
             timings['%s_ms' % bucket] = value
-    return timings or None
+
+    # Per-task timeline DETAIL blob — gzipped only when it carries at
+    # least one task, so the caller never sets `request_timings_upload`
+    # nor PUTs an empty blob. Mirrors the deps-blob "summary + blob"
+    # split exactly.
+    timeline = parsed.get('timeline')
+    timeline_gz = None
+    if timeline and timeline.get('tasks'):
+        timeline_gz = _timeline_blob_gz(timeline)
+
+    return (timings or None), timeline_gz
 
 
 # -----------------------------------------------------------------
@@ -2124,7 +2639,7 @@ def resolve_build_timings(env):
 # The flow has two layers:
 #
 #   - **build-info** (default ON, release-only): every Release archive
-#     posts a build record to the Bugsee appserver carrying version,
+#     posts a build record to the Bugsee back-end carrying version,
 #     build, package_id, VCS, build-machine, plugin / Xcode / SDK
 #     versions, timings, and the artefact's file size. The record
 #     unlocks crash-context enrichment (commit lookup) and serves as
@@ -2330,12 +2845,12 @@ def run_size_analysis_flow(app_token):
         agent_version = resolve_agent_version()
 
         # Assemble the Android-compatible payload shape so the
-        # appserver persists both platforms identically.
+        # back-end persists both platforms identically.
         #
         # `uuid` is the main executable's Mach-O `LC_UUID` — the same
         # identifier the runtime SDK reports with every crash for
         # dSYM symbolication (BGSCrashReport.m). Sending it here
-        # lets the appserver deterministically join
+        # lets the back-end deterministically join
         # `crash.uuid → build` without any Info.plist injection or
         # pre-build phase. The linker assigns a fresh LC_UUID per
         # build, so each build still gets a unique identifier the
@@ -2361,14 +2876,14 @@ def run_size_analysis_flow(app_token):
             payload['build_configuration'] = config
 
         # Size-analysis is the optional sub-feature that flips the
-        # appserver's flow from "register only" (default) to
+        # back-end's flow from "register only" (default) to
         # "register + sign a presigned PUT URL for the artefact".
         # The IPA was packaged above regardless, since the size-check
         # baseline always wants `artifact_size` recorded — the
         # difference here is whether the bytes also get shipped.
         size_analysis_enabled = _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_ENABLED'))
         payload['request_artifact_upload'] = size_analysis_enabled
-        # VCS block — nested under `vcs` to match the appserver's
+        # VCS block — nested under `vcs` to match the back-end's
         # `VcsMetadataSchema`. Omitted entirely when the resolver
         # produced no fields (local dev machine, no CI context, no
         # git info) so the server distinguishes "unknown" cleanly.
@@ -2394,11 +2909,58 @@ def run_size_analysis_flow(app_token):
         sdk_name = (env.get('SDK_NAME') or '').strip()
         if sdk_name:
             metadata['build_sdk_version'] = sdk_name
-        timings = resolve_build_timings(env)
-        if timings:
-            metadata['timings'] = timings
+        # Build-timings collection gate. Mirrors the Gradle plugin's
+        # `bugsee.buildInfo.timings.enabled` DSL option. Default ON
+        # via `_env_truthy_default_true`, so users see meaningful
+        # data unless they explicitly opt out (e.g. privacy-sensitive
+        # shops who don't want target / section names on external
+        # servers). When disabled the inline `build_metadata.timings`
+        # block is omitted entirely — the server then leaves
+        # `build_metadata.timings` absent on the build doc and the
+        # front-end's Timings tab degrades gracefully.
+        timings_gz = None
+        timings_enabled = _env_truthy_default_true(
+            env.get('BUGSEE_BUILD_INFO_TIMINGS_ENABLED'))
+        if timings_enabled:
+            timings, timings_gz = resolve_build_timings(env)
+            if timings:
+                metadata['timings'] = timings
+            # Per-task timeline DETAIL blob — request the presigned
+            # `timings_upload_endpoint` only when there's a non-empty
+            # timeline to ship, mirroring the deps-blob
+            # `request_dependencies_upload` gate. The gate is implicit
+            # in `timings_gz` being non-None (resolve_build_timings
+            # only gzips a timeline that carries at least one task).
+            if timings_gz:
+                payload['request_timings_upload'] = True
         if metadata:
             payload['build_metadata'] = metadata
+
+        # Dependency collection gate. Mirrors the Gradle plugin's
+        # `bugsee.buildInfo.dependencies.enabled` DSL option, overridable
+        # via the `BUGSEE_DEPENDENCIES_ENABLED` env var. Default ON via
+        # `_env_truthy_default_true`, so users get vuln-scan + deps-diff
+        # without extra config. When enabled, the agent parses the
+        # project's CocoaPods / SPM / Carthage lockfiles into the same
+        # deps-blob wire shape the Android plugin emits, sets the inline
+        # `dependencies_summary` + `request_dependencies_upload` flag on
+        # the metadata POST, and PUTs the gzipped blob to the presigned
+        # `dependencies_upload_endpoint` the server returns. Independent
+        # of size analysis — deps ship on the build-info-only path too.
+        # Opt out (privacy / noise) leaves the summary absent and PUTs
+        # nothing; the server then runs no scan for this build.
+        deps_gz = None
+        deps_enabled = _env_truthy_default_true(
+            env.get('BUGSEE_DEPENDENCIES_ENABLED'))
+        if deps_enabled:
+            deps_summary, deps_gz = collect_dependencies(env)
+            if deps_summary and deps_gz:
+                payload['request_dependencies_upload'] = True
+                payload['dependencies_summary'] = deps_summary
+            else:
+                # No lockfile / nothing parsed — keep deps_gz None so
+                # the upload path PUTs nothing.
+                deps_gz = None
 
         debug = _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_DEBUG'))
 
@@ -2406,7 +2968,7 @@ def run_size_analysis_flow(app_token):
         # baseline lookup naturally excludes the build we are about
         # to create — there's nothing on the server with our `uuid`
         # at this moment. Doing it after the upload would create a
-        # narrow race window where a fast worker could promote our
+        # narrow race window where a fast back-end could promote our
         # build to `status='ready'` before the lookup runs, returning
         # the new build as its own baseline (`delta == 0`, false PASS).
         # `prepare_size_check` returns `(None, None)` for every "skip"
@@ -2433,13 +2995,15 @@ def run_size_analysis_flow(app_token):
         chunked_succeeded = False
         if chunked_requested:
             chunked_succeeded = try_chunked_upload(
-                endpoint, app_token, ipa_path, payload, debug=debug
+                endpoint, app_token, ipa_path, payload, debug=debug,
+                deps_gz=deps_gz, timings_gz=timings_gz
             )
             if not chunked_succeeded:
                 print("Bugsee: chunked upload failed — falling back to single-PUT")
 
         if not chunked_succeeded:
-            upload_build(endpoint, app_token, ipa_path, payload, debug=debug)
+            upload_build(endpoint, app_token, ipa_path, payload, debug=debug,
+                         deps_gz=deps_gz, timings_gz=timings_gz)
 
         # In-build size-check evaluation. Runs regardless of upload
         # outcome — the check only needs the local size + the
@@ -2554,6 +3118,329 @@ def run_dsym_flow(app_token):
 
     # cleanup
     shutil.rmtree(tempDir, ignore_errors=True)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Dependency collection (iOS — CocoaPods / SPM / Carthage)
+#
+# Produces the SAME deps-blob wire shape the Android Gradle plugin's
+# DependencyPayloadSerializer emits, so the back-end's vuln-scan and
+# dependency-diff treat iOS and Android builds identically:
+#
+#   gz blob: { "schema_version": 1, "truncated": <bool>,
+#              "collection_config": {scope, include_selected_reason,
+#                                    max_count},
+#              "dependencies": [ {id, group, name, version?, direct,
+#                                 type:"library", ecosystem?, url?}, ...] }
+#
+#   inline `dependencies_summary` (in the metadata POST body):
+#              { total, direct, transitive,
+#                by_type:{library,project,file}, truncated,
+#                collected_at (ISO-8601 Z), collection_config }
+#
+# Ecosystems the back-end maps for iOS deps:
+#   - "spm"       -> OSV `SwiftURL`; MUST carry `url` (package Git URL)
+#   - "cocoapods" -> OSV `SwiftURL`; the back-end resolves the pod's
+#                    source.git via the CocoaPods CDN, so `url` is
+#                    optional here.
+# Every entry is type "library" (no project/file analogue on iOS) with
+# an empty `group`. Stdlib-only: the agent ships no PyYAML, so the
+# CocoaPods `Podfile.lock` parser is hand-rolled against its (very
+# regular) structure.
+# ──────────────────────────────────────────────────────────────────
+
+_DEPS_SCHEMA_VERSION = 1
+# Safety cap on the per-entry list; mirrors the Gradle plugin default.
+_DEPS_MAX_COUNT = 5000
+# iOS lockfiles are the fully-resolved graph; a fixed scope label keeps
+# the back-end's build-over-build compatibility check ("same scope =
+# comparable") satisfied across iOS builds.
+_DEPS_COLLECTION_SCOPE = "resolved"
+
+
+def _dep_entry(name, version, ecosystem, direct, url=None):
+    """Normalise one dependency into the wire-contract entry shape.
+    `group` is always "" for iOS ecosystems; `id` mirrors the Gradle
+    plugin's `<type>:<group>:<name>`. `ecosystem`/`url`/`version` are
+    omitted when absent so the shape stays minimal (consumers treat
+    missing as not-applicable)."""
+    entry = {
+        'id': 'library::%s' % name,
+        'group': '',
+        'name': name,
+        'direct': bool(direct),
+        'type': 'library',
+    }
+    if version:
+        entry['version'] = version
+    if ecosystem:
+        entry['ecosystem'] = ecosystem
+    if url:
+        entry['url'] = url
+    return entry
+
+
+def _parse_podfile_lock(text):
+    """Parse a CocoaPods `Podfile.lock` (a constrained YAML subset).
+
+    Only two sections matter:
+      - `PODS:` lists every RESOLVED pod as `  - Name (X.Y.Z)`. Deeper-
+        indented `    - Dep (constraint)` lines are that pod's
+        dependency RELATIONSHIPS, not resolved versions — ignored.
+      - `DEPENDENCIES:` lists the DIRECT pods the Podfile declared.
+    Subspecs (`Pod/Sub`) collapse to their root pod (one OSV query per
+    pod). Returns `_dep_entry` dicts (ecosystem 'cocoapods', no url —
+    the back-end resolves source.git via the CocoaPods CDN)."""
+    section = None
+    versions = {}      # root pod -> resolved version
+    direct = set()     # root pods declared in DEPENDENCIES
+    for raw_line in text.splitlines():
+        # Section headers sit at column 0 and end with ':'.
+        header = re.match(r'^([A-Z][A-Z0-9 _-]*):', raw_line)
+        if header and not raw_line.startswith(' '):
+            section = header.group(1).strip()
+            continue
+        # Top-level list items are EXACTLY two-space indented `  - `.
+        # (Four-space `    - ` sub-deps fail this match.)
+        item = re.match(r'^  - (.+)$', raw_line)
+        if not item:
+            continue
+        body = item.group(1).strip()
+        if section == 'PODS':
+            m = re.match(r'^(?P<spec>\S[^()]*?)\s*(?:\((?P<ver>[^)]+)\))?\s*:?\s*$', body)
+            if not m:
+                continue
+            root = m.group('spec').split('/')[0].strip()
+            if not root:
+                continue
+            ver = (m.group('ver') or '').strip() or None
+            # Keep the first concrete version seen for the root pod
+            # (the root `Pod (X)` entry and its `Pod/Sub (X)` subspecs
+            # all carry the same resolved version).
+            if root not in versions or (ver and not versions[root]):
+                versions[root] = ver
+        elif section == 'DEPENDENCIES':
+            m = re.match(r'^(?P<spec>\S[^()]*?)\s*(?:\([^)]*\))?\s*$', body)
+            if m:
+                root = m.group('spec').split('/')[0].strip()
+                if root:
+                    direct.add(root)
+    return [
+        _dep_entry(name=name, version=ver, ecosystem='cocoapods',
+                   direct=name in direct)
+        for name, ver in versions.items()
+    ]
+
+
+def _parse_package_resolved(text):
+    """Parse an SPM `Package.resolved` (JSON). Handles v1 (`object.pins`,
+    `repositoryURL`, `package`) and v2/v3 (top-level `pins`, `location`,
+    `identity`). The OSV SwiftURL query keys off `url` (the package Git
+    URL); `name` is the package identity (stable diff key). SPM doesn't
+    record direct-vs-transitive, so entries default to direct."""
+    data = json.loads(text)
+    if isinstance(data.get('object'), dict):       # v1
+        pins = data['object'].get('pins') or []
+    else:                                           # v2 / v3
+        pins = data.get('pins') or []
+    entries = []
+    for pin in pins:
+        if not isinstance(pin, dict):
+            continue
+        name = pin.get('identity') or pin.get('package')
+        url = pin.get('location') or pin.get('repositoryURL')
+        state = pin.get('state') if isinstance(pin.get('state'), dict) else {}
+        ver = state.get('version')
+        # `version` is taken verbatim from JSON. It's almost always a
+        # string, but a hand-edited / future-format `Package.resolved`
+        # could carry a numeric (or other) type — coerce to str so the
+        # wire contract stays a string, matching `str(name)` below.
+        if ver is not None:
+            ver = str(ver)
+        if not name:
+            continue
+        entries.append(_dep_entry(name=str(name), version=ver,
+                                  ecosystem='spm', direct=True, url=url))
+    return entries
+
+
+def _parse_cartfile_resolved(text):
+    """Parse a Carthage `Cartfile.resolved`. Lines look like
+    `github "Owner/Repo" "1.2.3"`, `git "https://host/x.git" "rev"`, or
+    `binary "https://.../spec.json" "1.0"`. github/git map to OSV
+    SwiftURL via the resolved Git URL; binary has no Git URL so it's
+    listed without an ecosystem (shown in the deps list, skipped by
+    vuln-scan). Cartfile.resolved is the full resolved set, so
+    direct-vs-transitive is unknown — default to direct.
+
+    NOTE: the back-end has no dedicated Carthage ecosystem (its map keys
+    on cocoapods/spm/swift). We deliberately label github/git Carthage
+    deps as `spm` so they ride SwiftURL's URL-keyed matching — SwiftURL
+    resolves on the package Git URL, not the package manager, so a
+    Carthage Git dependency is matchable exactly as the same repo
+    consumed via SPM. Caveat: a repo whose Carthage tag scheme differs
+    from its Swift-package tags may not version-match a vuln."""
+    entries = []
+    for line in text.splitlines():
+        m = re.match(r'^\s*(github|git|binary)\s+"([^"]+)"\s+"([^"]+)"\s*$', line)
+        if not m:
+            continue
+        kind, loc, ver = m.group(1), m.group(2), m.group(3)
+        if kind == 'github':
+            if loc.startswith('http'):
+                url, name = loc, loc.rstrip('/').split('/')[-1]
+            else:
+                url, name = 'https://github.com/%s' % loc, loc
+            entries.append(_dep_entry(name=name, version=ver, ecosystem='spm',
+                                      direct=True, url=url))
+        elif kind == 'git':
+            name = loc.rstrip('/').split('/')[-1]
+            if name.endswith('.git'):
+                name = name[:-4]
+            entries.append(_dep_entry(name=name, version=ver, ecosystem='spm',
+                                      direct=True, url=loc))
+        else:  # binary: no Git URL, can't map to OSV — list, don't scan
+            name = loc.rstrip('/').split('/')[-1]
+            entries.append(_dep_entry(name=name, version=ver,
+                                      ecosystem=None, direct=True))
+    return entries
+
+
+def _spm_resolved_paths(root):
+    """SPM stores `Package.resolved` at the project root for a bare SPM
+    project, or under the .xcodeproj / .xcworkspace's swiftpm data for
+    an Xcode-integrated one. Return the existing candidates. Uses
+    `os.listdir` rather than `glob` (not imported by the agent)."""
+    candidates = [os.path.join(root, 'Package.resolved')]
+    try:
+        for name in os.listdir(root):
+            if name.endswith('.xcodeproj'):
+                candidates.append(os.path.join(
+                    root, name, 'project.xcworkspace', 'xcshareddata',
+                    'swiftpm', 'Package.resolved'))
+            elif name.endswith('.xcworkspace'):
+                candidates.append(os.path.join(
+                    root, name, 'xcshareddata', 'swiftpm', 'Package.resolved'))
+    except OSError:
+        pass
+    return [p for p in candidates if os.path.isfile(p)]
+
+
+def _safe_parse(path, parser):
+    """Read + parse one lockfile, best-effort: a missing file or a parse
+    error degrades to "no entries from this manager" and never raises —
+    a malformed lockfile must not fail the user's archive."""
+    try:
+        if not os.path.isfile(path):
+            return []
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            return parser(f.read()) or []
+    except Exception as e:
+        print("Bugsee: dependency parse skipped for %s: %s" % (path, e))
+        return []
+
+
+def _deps_summary(entries, truncated, collection_config):
+    """Inline scalar summary embedded in the metadata POST body."""
+    direct = sum(1 for e in entries if e.get('direct'))
+    return {
+        'total': len(entries),
+        'direct': direct,
+        'transitive': len(entries) - direct,
+        'by_type': {'library': sum(1 for e in entries if e.get('type') == 'library'),
+                    'project': 0, 'file': 0},
+        'truncated': truncated,
+        'collected_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'collection_config': collection_config,
+    }
+
+
+def _deps_blob_gz(entries, truncated, collection_config):
+    """Gzipped JSON blob (compact, no whitespace) PUT to the presigned
+    `dependencies_upload_endpoint`. Shape matches the Gradle plugin's."""
+    blob = {
+        'schema_version': _DEPS_SCHEMA_VERSION,
+        'truncated': truncated,
+        'collection_config': collection_config,
+        'dependencies': entries,
+    }
+    raw = json.dumps(blob, separators=(',', ':')).encode('utf-8')
+    return gzip.compress(raw)
+
+
+def collect_dependencies(env):
+    """Best-effort wrapper around [_collect_dependencies_impl].
+
+    Returns `(summary_dict, gz_bytes)`, or `(None, None)` when no
+    lockfile is present, nothing parsed, OR any error occurs. Mirrors
+    `resolve_build_timings`: dependency collection is a build-info
+    add-on, so a failure here (a malformed lockfile that slips past the
+    per-manager `_safe_parse`, a gzip/serialization fault, a malformed
+    entry in the dedupe pass, etc.) MUST degrade to "no dependencies"
+    rather than escape into `run_size_analysis_flow` and abort the whole
+    build-publish upload — the artifact + size-check would otherwise be
+    lost even though the IPA was already packaged."""
+    try:
+        return _collect_dependencies_impl(env)
+    except Exception as e:
+        print(
+            "Bugsee: dependency collection failed (%s) — "
+            "omitting dependencies from build_metadata" % str(e)
+        )
+        return None, None
+
+
+def _collect_dependencies_impl(env):
+    """Locate + parse the project's CocoaPods / SPM / Carthage lockfiles
+    under the source root and build the deps blob + inline summary.
+
+    Returns `(summary_dict, gz_bytes)`, or `(None, None)` when no
+    lockfile is present or nothing parsed. Best-effort PER MANAGER — a
+    parse failure on one manager skips only that manager (see
+    `_safe_parse`); the broad catch-all guard lives in the
+    [collect_dependencies] wrapper above."""
+    root = (env.get('PROJECT_DIR') or env.get('SRCROOT')
+            or env.get('SOURCE_ROOT') or os.getcwd())
+
+    entries = []
+    entries += _safe_parse(os.path.join(root, 'Podfile.lock'), _parse_podfile_lock)
+    for spm_path in _spm_resolved_paths(root):
+        entries += _safe_parse(spm_path, _parse_package_resolved)
+    entries += _safe_parse(os.path.join(root, 'Cartfile.resolved'), _parse_cartfile_resolved)
+
+    # Dedupe by identity. A package can surface via two managers (e.g.
+    # CocoaPods + SPM, or SPM + Carthage of the same repo); collapse to
+    # one entry. On a collision prefer the entry carrying a `url` — OSV's
+    # SwiftURL ecosystem keys off it, so dropping the url-bearing variant
+    # in favour of a url-less one (e.g. a CocoaPods entry, which has no
+    # url) would silently exclude that package from the vuln scan. Ties
+    # (both or neither carry a url) keep the first seen — i.e. manager
+    # append order (Podfile -> SPM -> Carthage).
+    best_by_id = {}
+    for e in entries:
+        prev = best_by_id.get(e['id'])
+        if prev is None or ('url' in e and 'url' not in prev):
+            best_by_id[e['id']] = e
+    if not best_by_id:
+        return None, None
+    # Sort by id for deterministic output.
+    deduped = sorted(best_by_id.values(), key=lambda x: x['id'])
+
+    truncated = len(deduped) > _DEPS_MAX_COUNT
+    if truncated:
+        # Keep DIRECT deps preferentially when over the cap — they're the
+        # ones users act on, and dropping a direct dep that merely sorts
+        # late alphabetically would be surprising. Stable sort floats
+        # direct entries first while preserving id-order within each group.
+        deduped.sort(key=lambda e: (not e.get('direct'),))
+        deduped = deduped[:_DEPS_MAX_COUNT]
+    collection_config = {
+        'scope': _DEPS_COLLECTION_SCOPE,
+        'include_selected_reason': False,
+        'max_count': _DEPS_MAX_COUNT,
+    }
+    return (_deps_summary(deduped, truncated, collection_config),
+            _deps_blob_gz(deduped, truncated, collection_config))
 
 
 def main():
