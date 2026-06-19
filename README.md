@@ -53,6 +53,24 @@ Import Bugsee header file in your app delegate or the file you intend to initial
 ```swift
 import Bugsee
 ```
+
+**SwiftUI**
+
+When installed via Swift Package Manager, Bugsee also ships an optional `BugseeSwiftUI`
+module with SwiftUI conveniences (such as protecting sensitive views from recordings).
+Import it alongside `Bugsee` where you use those helpers:
+
+```swift
+import Bugsee
+import BugseeSwiftUI
+
+// Hide a sensitive view from video recordings:
+Text(secret)
+    .bugseeProtect()
+```
+
+`BugseeSwiftUI` requires iOS 13+; on iOS 12 the core `Bugsee` module remains fully usable.
+
 ## Initialization
 
 Locate your app delegate and initialize the framework in your *application:didFinishLaunchingWithOptions* method:

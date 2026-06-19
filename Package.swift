@@ -5,15 +5,21 @@ import PackageDescription
 
 let package = Package(
     name: "Bugsee",
+    platforms: [
+        .iOS(.v12)
+    ],
     products: [
-        .library(
-            name: "Bugsee",
-            targets: ["Bugsee"])
+        .library(name: "Bugsee", targets: ["Bugsee"]),
+        .library(name: "BugseeSwiftUI", targets: ["Bugsee", "BugseeSwiftUI"])
     ],
     targets: [
         .binaryTarget(
             name: "Bugsee",
-            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-6.1.6.zip",
-            checksum: "7a36c1b52d4a80b6fc79d29dfd99c4ca7dde2825886a5b073726eaa14b384b16")
+            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-6.2.0.zip",
+            checksum: "41db473fbeef891d2d6c8945e0362abee599e584aa9d4bf1e2b97296976dffe8"),
+        .target(
+            name: "BugseeSwiftUI",
+            dependencies: ["Bugsee"],
+            path: "Sources/BugseeSwiftUI")
     ]
 )
