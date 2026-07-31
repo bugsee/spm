@@ -104,6 +104,31 @@
 #     an already-signed build from a post-action. CI runs that need
 #     hard gating on size growth should grep the daemon log for the
 #     `error: Bugsee size check` prefix.
+#
+#   BUGSEE_CLI_PATH
+#     Explicit path to a `bugsee-cli` binary. When set and the binary
+#     is executable and new enough (see the version floor below), it is
+#     preferred over whatever `bugsee-cli` is found on `PATH`. Several
+#     build steps (dSYM UUID extraction, dependency / VCS / build-env
+#     collection, build-info bundle upload, size analysis) delegate to
+#     `bugsee-cli` when a usable one is resolved, falling back to an
+#     in-process Python implementation otherwise.
+#
+#     VERSION FLOOR: the agent only delegates to a `bugsee-cli` whose
+#     `--version` reports >= `BUGSEE_CLI_MIN_VERSION` (currently
+#     0.3.0), keeping it in sync with the fastlane / gradle
+#     integrations' version gate. A too-old binary (or one that can't
+#     report its version) is ignored and the Python path runs instead.
+#     When neither BUGSEE_CLI_PATH nor a PATH binary resolves, the
+#     agent auto-downloads the CLI as a final fallback (SHA-256
+#     verified, cached under ~/.bugsee/cli/). After downloading the
+#     pinned floor it runs `bugsee-cli update --max-age 12h`, letting
+#     the CLI bump itself in place to the latest same-major release
+#     (the CLI owns discovery, verify, self-replace, and a ~12h
+#     throttle). Only a binary the agent itself downloaded is updated —
+#     never a PATH / BUGSEE_CLI_PATH one. Disable auto-download /
+#     self-update with BUGSEE_CLI_AUTO_UPDATE=0/false/no/off; any
+#     failure is silent and the in-process Python path runs.
 
 import os
 import subprocess
@@ -121,6 +146,7 @@ import gzip
 import socket
 import math
 import time
+import platform
 import concurrent.futures
 from optparse import OptionParser
 import fnmatch
@@ -144,7 +170,531 @@ def loadUploadedList():
     except Exception as error:
         return []
 
+# Exception tuple every CLI-shelling helper catches. Pinned in one
+# place so all of `_resolve_*_via_cli` / `_collect_*_via_cli` /
+# `_parse_*_via_cli` / `_load_*_via_cli` / `_read_plist_via_cli`
+# follow the same fallback policy:
+#   - OSError: subprocess exec failure, pipe close, broken file handle
+#   - ValueError: malformed JSON from CLI stdout
+#   - TypeError: defensive — mocked subprocess.run can return MagicMock
+#     objects that explode in json.loads (the bite the dsym helper hit
+#     during TestParseDSYM hardening)
+#   - subprocess.CalledProcessError: side_effects in tests that raise
+#     rather than return a fake CompletedProcess
+_CLI_CATCHALL_EXCEPTIONS = (
+    OSError,
+    ValueError,
+    TypeError,
+    subprocess.CalledProcessError,
+    # TimeoutExpired: the CLI hung past its `subprocess.run(timeout=...)`
+    # cap. Treat as soft failure so the fallback path runs.
+    subprocess.TimeoutExpired,
+)
+
+
+# Minimum `bugsee-cli` version this agent will delegate to. Mirrors the
+# version floor the fastlane/gradle integrations enforce (see the gradle
+# plugin's `CliBinaryResolver.DEFAULT_VERSION` / `versionAtLeast`). A CLI
+# older than this — or one that can't report its version — is ignored and
+# the in-process Python implementation runs instead.
+BUGSEE_CLI_MIN_VERSION = "0.3.0"
+
+_VERSION_CORE_RE = re.compile(r"(\d+(?:\.\d+)*)")
+
+
+def _version_core(s):
+    """Leading dotted-int core as a tuple, or None. 'bugsee-cli 0.3.0' and
+    '0.3.0-rc1' both -> (0, 3, 0)."""
+    m = _VERSION_CORE_RE.search(s or "")
+    return tuple(int(p) for p in m.group(1).split(".")) if m else None
+
+
+def _cli_version_at_least(version_str, minimum):
+    """Numeric-component >= compare; missing trailing components pad with 0;
+    unparseable -> False. Mirrors the gradle CliBinaryResolver.versionAtLeast
+    (numeric, so 0.10.0 >= 0.3.0)."""
+    v, mn = _version_core(version_str), _version_core(minimum)
+    if v is None or mn is None:
+        return False
+    n = max(len(v), len(mn))
+    return v + (0,) * (n - len(v)) >= mn + (0,) * (n - len(mn))
+
+
+def _cli_meets_floor(cli):
+    """True iff `cli --version` reports >= BUGSEE_CLI_MIN_VERSION."""
+    try:
+        result = subprocess.run([cli, "--version"], capture_output=True,
+                                text=True, timeout=10, check=False)
+        if result.returncode != 0:
+            return False
+        return _cli_version_at_least(result.stdout, BUGSEE_CLI_MIN_VERSION)
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI auto-download + self-update
+#
+# Historically this SDK agent NEVER downloaded the CLI — it resolved
+# BUGSEE_CLI_PATH / PATH only, falling back to the in-process Python
+# flow when no usable binary was found. We now add an auto-download
+# FINAL layer (after PATH) so a fresh CI runner without a preinstalled
+# CLI still gets the canonical Rust path.
+#
+# The auto-download fetches the pinned FLOOR (BUGSEE_CLI_DEFAULT_VERSION)
+# and then delegates version discovery to the CLI itself: after a
+# successful download `_maybe_self_update` runs
+#
+#   bugsee-cli update --max-age 12h
+#
+# which discovers the newest same-major (non-breaking) release,
+# downloads + SHA-256-verifies it, and self-replaces the binary IN
+# PLACE. The CLI owns the ~12h throttle (a last-check timestamp next to
+# the binary; no-op/no-network when fresh) and is best-effort (any
+# failure → exit 0). We only self-update a binary we MANAGE (one we
+# auto-downloaded into ~/.bugsee/cli/...), never a PATH / explicit
+# BUGSEE_CLI_PATH one. EVERY failure path is quiet — a build is NEVER
+# broken or slowed by an update check. Disable via BUGSEE_CLI_AUTO_UPDATE.
+#
+# NOTE the two distinct floors:
+#   - BUGSEE_CLI_MIN_VERSION / BUGSEE_CLI_XCODE_MIN_VERSION are
+#     ACCEPTANCE floors: they gate whether a PATH/explicit binary is
+#     new enough to delegate to. Unchanged.
+#   - BUGSEE_CLI_DEFAULT_VERSION is the DOWNLOAD floor: the version the
+#     auto-download layer fetches before the CLI bumps itself in place.
+# ──────────────────────────────────────────────────────────────────
+
+# Download FLOOR — the version the auto-download layer fetches before
+# the CLI self-updates in place. Must be >= "0.6.0", the first release that
+# ships the `update` self-update command. Distinct from the acceptance
+# floors above.
+BUGSEE_CLI_DEFAULT_VERSION = "0.6.0"
+BUGSEE_CLI_DOWNLOAD_BASE = "https://download.bugsee.com/cli"
+# Strict version-string shape gating any value that flows into the
+# download URL or the on-disk cache path, so a malicious env var cannot
+# inject `/` or `..` segments to escape the cache root or redirect
+# downloads. Mirrors the fastlane agent's `_BUGSEE_CLI_VERSION_RE`.
+_BUGSEE_CLI_VERSION_RE = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$')
+
+# Self-update is delegated to the CLI. After the agent has DOWNLOADED a
+# binary it manages, it runs `bugsee-cli update --max-age 12h` once per
+# process — the CLI owns version discovery (newest same-major release),
+# download + SHA-256 verify, in-place self-replace, internal throttling
+# (a last-check timestamp next to the binary; no-op/no-network if fresh),
+# and best-effort failure (any error → exit 0). Gated on a managed
+# binary (never a PATH / BUGSEE_CLI_PATH one) and on BUGSEE_CLI_AUTO_UPDATE.
+_BUGSEE_CLI_SELF_UPDATE_MAX_AGE = "12h"
+_BUGSEE_CLI_SELF_UPDATE_TIMEOUT_SECONDS = 120
+
+
+def detectHostTriple():
+    """Map current OS+arch to a Rust target triple the CLI is published
+    for. Returns None for unsupported combinations. Mirrors the
+    fastlane agent's `detectHostTriple`."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    is_arm64 = machine in ("arm64", "aarch64")
+    is_amd64 = machine in ("x86_64", "amd64")
+    if system == "darwin":
+        if is_arm64:
+            return "aarch64-apple-darwin"
+        if is_amd64:
+            return "x86_64-apple-darwin"
+    elif system == "linux":
+        if is_arm64:
+            return "aarch64-unknown-linux-gnu"
+        if is_amd64:
+            return "x86_64-unknown-linux-gnu"
+    elif system.startswith("win") or system == "windows":
+        if is_amd64:
+            return "x86_64-pc-windows-msvc"
+    return None
+
+
+def _bugsee_cli_auto_update_enabled():
+    """Auto-update is ON unless BUGSEE_CLI_AUTO_UPDATE is an explicit
+    off token (`0` / `false` / `no` / `off`, case-insensitive)."""
+    raw = (os.environ.get("BUGSEE_CLI_AUTO_UPDATE") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+_SELF_UPDATE_DONE = False
+
+
+def _maybe_self_update(cli_path):
+    """Run `bugsee-cli update --max-age 12h` BEST-EFFORT on a binary the
+    agent MANAGES (i.e. one it auto-downloaded into ~/.bugsee/cli/...).
+
+    The CLI owns everything: discovering the newest same-major release,
+    download + SHA-256 verify, in-place self-replace, and its own ~12h
+    throttle (a last-check timestamp next to the binary; no-op/no-network
+    when fresh). This call therefore just fires the command and forgets:
+    it swallows EVERYTHING (timeout, non-zero exit, exec failure), NEVER
+    raises, and never prints to stdout. Memoized to run at most once per
+    process. Skipped when BUGSEE_CLI_AUTO_UPDATE is disabled."""
+    global _SELF_UPDATE_DONE
+    if _SELF_UPDATE_DONE:
+        return
+    _SELF_UPDATE_DONE = True
+    if not cli_path or not _bugsee_cli_auto_update_enabled():
+        return
+    try:
+        subprocess.run(
+            [cli_path, "update", "--max-age",
+             _BUGSEE_CLI_SELF_UPDATE_MAX_AGE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=_BUGSEE_CLI_SELF_UPDATE_TIMEOUT_SECONDS, check=False,
+        )
+    except Exception:
+        # Best-effort: a hung / failing / missing CLI must never break or
+        # slow the build. Ignore the return code and any exception
+        # (TimeoutExpired included).
+        pass
+
+
+def _download_cli(version, triple):
+    """Fetch the CLI tarball + SHA-256 sidecar for `version`/`triple`,
+    verify, extract into ~/.bugsee/cli/<version>/<triple>/, chmod +x,
+    and return the binary path — or None on ANY failure (never raises).
+
+    Mirrors the fastlane agent's `_downloadCli` but returns None on
+    failure instead of raising, so the caller can fall through to the
+    in-process Python flow. The download origin is pinned to
+    https://download.bugsee.com regardless of BUGSEE_CLI_DOWNLOAD_BASE
+    shadowing."""
+    if not version or not _BUGSEE_CLI_VERSION_RE.fullmatch(version):
+        return None
+    if not triple:
+        return None
+
+    is_windows = "windows" in triple
+    ext = "zip" if is_windows else "tar.xz"
+    artifact = "bugsee-cli-%s.%s" % (triple, ext)
+    url = "%s/v%s/%s" % (BUGSEE_CLI_DOWNLOAD_BASE, version, artifact)
+    sha_url = url + ".sha256"
+
+    # Origin pin — refuse anything but https://download.bugsee.com even
+    # if the base const is shadowed or a typo'd version sneaks a path
+    # segment past the regex (it can't, but defence-in-depth).
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != "download.bugsee.com":
+        return None
+
+    cache_dir = os.path.expanduser(
+        os.path.join("~/.bugsee/cli", version, triple))
+    binary_name = "bugsee-cli.exe" if is_windows else "bugsee-cli"
+    binary_path = os.path.join(cache_dir, binary_name)
+
+    # Cache hit — already downloaded on a prior run.
+    if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
+        return binary_path
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # SHA-256 sidecar: `<hex>  <filename>` / `<hex> *<filename>` / `<hex>`.
+        with urllib.request.urlopen(sha_url, timeout=30) as resp:
+            expected_sha = resp.read().decode("utf-8").strip().split()[0]
+
+        tarball_path = os.path.join(cache_dir, artifact)
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            with open(tarball_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+
+        h = hashlib.sha256()
+        with open(tarball_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        if expected_sha.lower() != h.hexdigest().lower():
+            os.unlink(tarball_path)
+            return None
+
+        # System `tar` handles tar.xz (macOS/Linux) and zip (Win 10+ bsdtar).
+        # `--strip-components=1` peels the `bugsee-cli-<triple>/` wrapper dir.
+        result = subprocess.run(
+            ["tar", "-xf", tarball_path, "-C", cache_dir,
+             "--strip-components=1"],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        os.unlink(tarball_path)
+
+        if not os.path.isfile(binary_path):
+            return None
+        os.chmod(binary_path, 0o755)
+    except Exception:
+        return None
+
+    if os.path.isfile(binary_path) and os.access(binary_path, os.X_OK):
+        return binary_path
+    return None
+
+
+def _resolve_cli_via_download():
+    """Auto-download layer: download the pinned floor version, then ask
+    the CLI to self-update in place to the latest same-major release.
+    Returns the binary path iff it meets the acceptance floor. Returns
+    None on any failure / when auto-update is disabled / when the host
+    has no published triple — so the caller falls through to the
+    in-process Python flow.
+
+    The download fetches the pinned floor (BUGSEE_CLI_DEFAULT_VERSION);
+    version discovery is no longer done here — `_maybe_self_update`
+    delegates that to `bugsee-cli update --max-age 12h`, which bumps the
+    downloaded binary in place. We only self-update binaries WE manage
+    (auto-downloaded into ~/.bugsee/cli/...), never a PATH / explicit one.
+
+    Conservative: a check that can't complete (offline, unsupported
+    host, SHA mismatch, disabled) just yields None; it NEVER raises and
+    NEVER blocks the existing fallback."""
+    if not _bugsee_cli_auto_update_enabled():
+        return None
+    triple = detectHostTriple()
+    if triple is None:
+        return None
+    version = BUGSEE_CLI_DEFAULT_VERSION
+    if not version or not _BUGSEE_CLI_VERSION_RE.fullmatch(version):
+        return None
+    cli = _download_cli(version, triple)
+    if not cli:
+        return None
+    # We downloaded and therefore MANAGE this binary — let the CLI bump
+    # it in place to the latest same-major release (best-effort, once
+    # per process). Never mutate a PATH / BUGSEE_CLI_PATH binary.
+    _maybe_self_update(cli)
+    # Validate the downloaded binary against the acceptance floor the
+    # same way a PATH binary is gated.
+    if os.path.isfile(cli) and os.access(cli, os.X_OK) and _cli_meets_floor(cli):
+        return cli
+    return None
+
+
+_UNRESOLVED_CLI = object()
+_RESOLVED_CLI = _UNRESOLVED_CLI
+
+
+def _reset_cli_cache():
+    """Test hook: drop the memoized resolution + self-update memo."""
+    global _RESOLVED_CLI, _SELF_UPDATE_DONE
+    _RESOLVED_CLI = _UNRESOLVED_CLI
+    _SELF_UPDATE_DONE = False
+
+
+def _resolve_cli_uncached():
+    # Precedence: BUGSEE_CLI_PATH env -> PATH (shutil.which) ->
+    # auto-download -> None. The first two prefer a developer- or
+    # CI-provided binary; the auto-download layer is the final fallback
+    # so a fresh runner without a preinstalled CLI still gets one.
+    candidates = []
+    explicit = os.environ.get("BUGSEE_CLI_PATH")
+    if explicit:
+        candidates.append(explicit)
+    on_path = shutil.which("bugsee-cli")
+    if on_path:
+        candidates.append(on_path)
+    for cli in candidates:
+        if os.path.isfile(cli) and os.access(cli, os.X_OK) and _cli_meets_floor(cli):
+            return cli
+    # Final layer: auto-download (auto-update contract). Soft — returns
+    # None on any failure / when disabled so the in-process Python
+    # fallback still runs.
+    downloaded = _resolve_cli_via_download()
+    if downloaded:
+        return downloaded
+    return None
+
+
+def _resolve_cli():
+    """Resolve a usable `bugsee-cli` (>= BUGSEE_CLI_MIN_VERSION) from
+    BUGSEE_CLI_PATH, PATH, or — as a final fallback — by auto-downloading
+    it (auto-update contract; disable via BUGSEE_CLI_AUTO_UPDATE). Returns
+    None so the caller falls back to the in-process Python implementation
+    when no usable binary can be resolved. Memoized: every CLI helper calls
+    this, so the probe / download runs at most once per process.
+
+    The auto-download layer is offline-safe: any failure (network down,
+    unsupported host, SHA mismatch, disabled) yields None and the Python
+    fallback runs — a build is never broken or slowed by it."""
+    global _RESOLVED_CLI
+    if _RESOLVED_CLI is _UNRESOLVED_CLI:
+        _RESOLVED_CLI = _resolve_cli_uncached()
+    return _RESOLVED_CLI
+
+
+# ───────────────────────── bootstrapper ──────────────────────────────
+#
+# Option-A: delegate the WHOLE Xcode build-publish + dSYM flow to one
+# CLI command — `bugsee-cli xcode post-action`. This agent shrinks to a
+# bootstrapper (resolve a new-enough CLI) + fallback (the in-process
+# Python flow when the CLI is missing / too old / structurally fails).
+
+# Minimum `bugsee-cli` version that ships the consolidated
+# `xcode post-action` command (deps + timings + `.ipa` packaging +
+# register + artefact + dSYM + size-check, with a JSON result report on
+# stdout). DISTINCT from BUGSEE_CLI_MIN_VERSION (0.3.0): the per-op
+# delegations (dsym / vcs / ios-deps / build-env / build-info /
+# upload-build) work from 0.3.0, but the single-command flow lands in a
+# later release. MUST match the CLI version that publishes the command.
+BUGSEE_CLI_XCODE_MIN_VERSION = "0.4.0"
+
+# Exit code `bugsee-cli` uses for a deliberate size-check FAIL
+# (src/exit_code.rs `ExitCode::SizeCheckFailed`). Terminal: the build
+# SHOULD fail, but it is NOT a structural CLI failure, so we propagate it
+# (deferred, after the manifest write) rather than fall back to the
+# in-process flow — which would re-run everything and SKIP the gate.
+BUGSEE_CLI_EXIT_SIZE_CHECK_FAILED = 40
+
+
+def _cli_supports_xcode_post_action(cli):
+    """True iff `cli --version` reports >= BUGSEE_CLI_XCODE_MIN_VERSION
+    (the release that added the consolidated `xcode post-action`). A
+    0.3.x CLI meets BUGSEE_CLI_MIN_VERSION but lacks this command, so the
+    bootstrapper checks the higher floor before delegating the whole
+    flow."""
+    try:
+        result = subprocess.run([cli, "--version"], capture_output=True,
+                                text=True, timeout=10, check=False)
+        if result.returncode != 0:
+            return False
+        return _cli_version_at_least(result.stdout,
+                                     BUGSEE_CLI_XCODE_MIN_VERSION)
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return False
+
+
+def _parse_cli_result(stdout):
+    """Parse the CLI's JSON result report — the LAST `{...}` line it
+    printed to stdout. Returns a dict, or None when absent/unparseable.
+    Tracing goes to the CLI's stderr, so in the foreground stdout carries
+    only this one line; scanning from the end tolerates stray output."""
+    if not stdout:
+        return None
+    for line in reversed(stdout.splitlines()):
+        line = line.strip()
+        if line.startswith('{') and line.endswith('}'):
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    return None
+
+
+def _run_xcode_post_action_via_cli(cli, app_token):
+    """Delegate the WHOLE build-publish + dSYM flow to
+    `bugsee-cli xcode post-action --force-foreground`.
+
+    `--force-foreground` keeps the CLI synchronous: THIS agent already
+    owns the daemon double-fork (see __main__), so the CLI must run
+    inside it and hand back the real exit code plus its JSON result
+    report (which feeds the handshake manifest). Returns a dict:
+
+        {'handled': bool, 'should_fallback': bool,
+         'exit_code': int|None, 'result': dict|None}
+
+    Exit-code contract (mirrors the gradle/fastlane integrations):
+        0                -> handled, no fallback.
+        40 (size-check)  -> handled, no fallback, deferred exit 40.
+        1 / 2 (struct.)  -> NOT handled -> fall back to the Python flow.
+        other (>=10)     -> handled, no fallback (substantive; the
+                            Python path would hit it identically)."""
+    _opts = globals().get('options')
+    endpoint = getattr(_opts, 'endpoint', None) or 'https://api.bugsee.com'
+    argv = [cli, "--endpoint", endpoint, "--app-token", app_token,
+            "xcode", "post-action", "--force-foreground"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=1800, check=False)
+    except _CLI_CATCHALL_EXCEPTIONS as e:
+        print("Bugsee: `bugsee-cli xcode post-action` could not run (%s); "
+              "falling back to in-process flow" % e)
+        return {'handled': False, 'should_fallback': True,
+                'exit_code': None, 'result': None}
+
+    # The CLI logs progress + the size-check `error:`/`warning:` lines to
+    # stderr; surface them so they land in the daemon's BugseeAgent.log.
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+
+    rc = proc.returncode
+    result = _parse_cli_result(proc.stdout)
+
+    if rc == 0:
+        if result is not None:
+            # Full run: the CLI did the work and reported its outcomes.
+            return {'handled': True, 'should_fallback': False,
+                    'exit_code': None, 'result': result}
+        # rc=0 with NO result report means the CLI GATED OUT (a Debug / non-
+        # archive build, or BUGSEE_BUILD_INFO_ENABLED=0) or found no `.app` — it
+        # did NOTHING. Fall back to the in-process flow so its INDEPENDENT gates
+        # still run. Crucially `should_run_dsym_flow` is gated ONLY on
+        # `dwarf-with-dsym` (NOT on Release), so dSYMs must still upload for the
+        # very builds the CLI's build-info gate skips — treating gate-out as
+        # "handled" would silently drop them.
+        print("Bugsee: `bugsee-cli xcode post-action` produced no result "
+              "(gated out / no .app); falling back to the in-process flow")
+        return {'handled': False, 'should_fallback': True,
+                'exit_code': None, 'result': None}
+    if rc == BUGSEE_CLI_EXIT_SIZE_CHECK_FAILED:
+        return {'handled': True, 'should_fallback': False,
+                'exit_code': rc, 'result': result}
+    if rc in (1, 2):
+        print("Bugsee: `bugsee-cli xcode post-action` exited %d (structural); "
+              "falling back to in-process flow" % rc)
+        return {'handled': False, 'should_fallback': True,
+                'exit_code': rc, 'result': result}
+    print("Bugsee: `bugsee-cli xcode post-action` exited %d (substantive); "
+          "not retrying in-process" % rc)
+    return {'handled': True, 'should_fallback': False,
+            'exit_code': None, 'result': result}
+
+
+def _parse_dsym_via_cli(fullPath):
+    """Shell to `bugsee-cli dsym uuid <path>`. Returns the parsed UUID
+    list (possibly empty — empty is authoritative for "nothing
+    parseable", matching the CLI's posture) or None when the CLI
+    cannot be invoked / produces unparseable output.
+
+    Part of the Option-C migration that moved canonical Mach-O UUID
+    extraction to the Rust CLI (see `bugsee-cli/src/cli/dsym.rs`).
+    The CLI uses `symbolic-debuginfo`'s Mach-O parser, which removes
+    the runtime dependency on the host's `/usr/bin/dwarfdump`."""
+    if not fullPath:
+        return None
+    cli = _resolve_cli()
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "dsym", "uuid", fullPath],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        if not isinstance(data, list):
+            return None
+        return [str(u) for u in data if isinstance(u, str)]
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return None
+
+
 def parseDSYM(fullPath):
+    """Extract Mach-O UUIDs from a `.dSYM` bundle or single Mach-O
+    binary. Prefers `bugsee-cli dsym uuid` (single cross-language
+    source of truth, ported from this Python — see
+    `bugsee-cli/src/cli/dsym.rs`). Falls back to the in-process
+    `dwarfdump -u` shell-out when the CLI is unavailable.
+
+    The CLI's empty-list return is authoritative — the caller treats
+    "no UUIDs" identically to a dwarfdump non-zero exit and skips the
+    upload."""
+    via_cli = _parse_dsym_via_cli(fullPath)
+    if via_cli is not None:
+        return via_cli
+
     images = []
     try:
         out = subprocess.run(['/usr/bin/dwarfdump', '-u', fullPath], check=True, capture_output=True, text=True).stdout
@@ -217,8 +767,20 @@ def getVersionAndBuild(zipFile):
     else:
         try:
             info_file_path = os.path.join(options.build_dir, os.environ['INFOPLIST_PATH'])
-            cmd = '/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" -c "Print :CFBundleVersion" "' + info_file_path + '"'
-            p = subprocess.Popen([cmd], stdout=subprocess.PIPE, shell=True)
+            # Argv list — never shell=True. The PlistBuddy invocation
+            # used to be `subprocess.Popen([cmd], shell=True)` with the
+            # info_file_path concatenated into the command string,
+            # which broke quoting on any project path containing a
+            # quote/apostrophe AND opened a shell-injection sink if
+            # INFOPLIST_PATH or build_dir came from an attacker-
+            # controlled env var. The list form bypasses the shell
+            # entirely.
+            p = subprocess.Popen([
+                '/usr/libexec/PlistBuddy',
+                '-c', 'Print :CFBundleShortVersionString',
+                '-c', 'Print :CFBundleVersion',
+                info_file_path,
+            ], stdout=subprocess.PIPE)
             stdout, stderr = p.communicate()
             version, build = stdout.decode().split()
         except Exception as error:
@@ -230,8 +792,17 @@ def uncrushIcon(icon, tempDir):
     try:
         dest = os.path.join(tempDir, 'icon.png')
         print("Uncrushing Icon PNG file to %s" % dest)
-        cmd = '/usr/bin/xcrun pngcrush -revert-iphone-optimizations "'+ icon + '" "' + dest + '"'
-        p = subprocess.Popen([cmd], stdout=subprocess.PIPE, shell=True)
+        # Argv list — bypass the shell so quotes / spaces / shell
+        # metacharacters in either path can't break the command or
+        # open an injection sink. Both `icon` and `dest` flow from
+        # caller-controlled values (Xcode env / tempDir).
+        p = subprocess.Popen([
+            '/usr/bin/xcrun',
+            'pngcrush',
+            '-revert-iphone-optimizations',
+            icon,
+            dest,
+        ], stdout=subprocess.PIPE)
 
         stdout, stderr = p.communicate()
     except Exception as error:
@@ -254,16 +825,21 @@ def requestEndPoint(app_token, version, build):
     return json.loads(text.decode())
 
 def uploadBundle(endpoint, filePath):
-    # TODO: Change it to urllib2 as well
-    cmd = 'curl -v -T "' + filePath + '" "' + endpoint + '"' + ' --write-out %{http_code} --silent --output /dev/null'
-    p = subprocess.Popen([cmd], 
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-    stdout, stderr = p.communicate()
-    code = stdout.decode()
-    if code == '200':
-        return True
-
-    return False
+    # PUT the file via urllib instead of shelling to curl. The
+    # original `curl -v -T "<filePath>" "<endpoint>"` was constructed
+    # by string concatenation and passed to `subprocess.Popen([cmd],
+    # shell=True)` — broken on any filePath/endpoint containing
+    # quotes and a shell-injection sink for the server-returned
+    # endpoint URL. urllib was already imported for adjacent
+    # requestEndPoint/updateStatus calls; reuse it.
+    try:
+        with open(filePath, 'rb') as f:
+            data = f.read()
+        req = urllib.request.Request(endpoint, data=data, method='PUT')
+        with urllib.request.urlopen(req) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
 
 def updateStatus(symbolId):
     encoded_data = json.dumps({
@@ -322,15 +898,45 @@ def uploadZipFile(app_token, zipFileLocation):
 # Machine / CI-runner resolver
 # -----------------------------------------------------------------
 
+def _resolve_machine_label_via_cli():
+    """Shell to `bugsee-cli build-env machine-label`. Returns the
+    trimmed stdout or None. Part of the Option-C migration that
+    moved canonical build-env helpers to the Rust CLI."""
+    cli = _resolve_cli()
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "build-env", "machine-label"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        return out if out else None
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return None
+
+
 def resolve_machine_label():
     """Returns a `<provider>[:<detail>]` label describing where the
     build ran — mirrors the cascade in Android's BuildMachineResolver
     so the front-end can group iOS + Android builds from the same CI
-    runner. Pure env-based detection; no shelling out.
+    runner.
+
+    Prefers `bugsee-cli build-env machine-label` (single cross-
+    language source of truth, ported from this Python — see
+    `bugsee-cli/src/cli/build_env.rs`). Falls back to the
+    in-process Python implementation below — pure env-based
+    detection, no shelling out.
 
     First positive provider signal wins. `None` when nothing matches
     AND hostname lookup also fails (sandboxed / networkless hosts).
     """
+    via_cli = _resolve_machine_label_via_cli()
+    if via_cli is not None:
+        return via_cli
+
     env = os.environ
 
     def with_detail(prefix, detail):
@@ -382,6 +988,38 @@ def _local_hostname():
 # VCS metadata resolver
 # -----------------------------------------------------------------
 
+def _resolve_vcs_metadata_via_cli(working_dir):
+    """Try `bugsee-cli vcs-metadata` if the binary is on PATH.
+
+    Part of Option C — the Rust CLI is the canonical implementation
+    of VCS resolution; both this SDK BugseeAgent and the fastlane
+    plugin's BugseeAgent shell to it and consume its JSON output.
+    The in-process Python implementation below is preserved as a
+    cold-start fallback for environments where the CLI isn't
+    installed.
+
+    Returns the parsed dict on success, or None on any failure
+    (CLI not on PATH, non-zero exit, malformed JSON, OSError).
+    The caller falls back to the Python implementation on None.
+    """
+    cli = _resolve_cli()
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "vcs-metadata", "--working-dir", working_dir or "."],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        return json.loads(out)
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return None
+
+
 def resolve_vcs_metadata(working_dir):
     """Returns a dict shaped for the upload JSON's nested `vcs`
     sub-object. Matches what the Android Gradle plugin emits so the
@@ -403,7 +1041,20 @@ def resolve_vcs_metadata(working_dir):
          none of the CI providers matched. Lets local dev archives
          still carry `commit_sha` / `branch` without needing CI
          context.
+
+    Implementation: prefers the Rust `bugsee-cli vcs-metadata`
+    subcommand when the binary is on PATH (the single cross-
+    language source of truth). Falls back to the in-process
+    Python implementation below when the CLI isn't installed.
+    The fastlane plugin's BugseeAgent uses the same pattern (it
+    also has an auto-download CLI resolver; this side keeps
+    things simpler with a `shutil.which` PATH lookup because the
+    Xcode build phase doesn't auto-download).
     """
+    via_cli = _resolve_vcs_metadata_via_cli(working_dir)
+    if via_cli is not None:
+        return via_cli
+
     env = os.environ
 
     # GitHub Actions ------------------------------------------------
@@ -418,8 +1069,18 @@ def resolve_vcs_metadata(working_dir):
             if m:
                 out['pr_number'] = int(m.group(1))
         else:
-            branch = (env.get('GITHUB_REF') or '').replace('refs/heads/', '', 1)
-            _set_if_present(out, 'branch', branch)
+            # Push event: GITHUB_REF carries `refs/heads/<branch>` for
+            # branch pushes, `refs/tags/<tag>` for tag pushes. Only
+            # emit `branch` when the ref is actually a head ref.
+            # `.replace('refs/heads/', '', 1)` returned the raw
+            # `refs/tags/v1.0.0` ref on tag pushes, which landed in
+            # the dashboard's branch column verbatim. Match the
+            # canonical Android Gradle plugin behaviour
+            # (`removePrefix.takeIf { it != ref }`) and the Rust CLI
+            # (bugsee-cli@cf1325f).
+            ref = (env.get('GITHUB_REF') or '')
+            if ref.startswith('refs/heads/'):
+                _set_if_present(out, 'branch', ref[len('refs/heads/'):])
         return out
 
     # GitLab CI -----------------------------------------------------
@@ -439,7 +1100,20 @@ def resolve_vcs_metadata(working_dir):
             except (TypeError, ValueError):
                 pass
         else:
-            _set_if_present(out, 'branch', env.get('CI_COMMIT_REF_NAME'))
+            # Branch vs tag pipeline distinction. GitLab CI sets:
+            #   - CI_COMMIT_BRANCH on branch pipelines (not tag).
+            #   - CI_COMMIT_TAG on tag pipelines (not branch).
+            #   - CI_COMMIT_REF_NAME is ALWAYS set; on tag pipelines
+            #     it equals the tag name, which would leak into the
+            #     branch column. Prefer the specific marker; fall
+            #     back to CI_COMMIT_REF_NAME only for legacy GitLab
+            #     (pre-12.6) that lacks them.
+            if (env.get('CI_COMMIT_BRANCH') or '').strip():
+                _set_if_present(out, 'branch', env.get('CI_COMMIT_BRANCH'))
+            elif (env.get('CI_COMMIT_TAG') or '').strip():
+                pass  # tag pipeline — branch stays absent
+            else:
+                _set_if_present(out, 'branch', env.get('CI_COMMIT_REF_NAME'))
         return out
 
     # Bitbucket Pipelines -------------------------------------------
@@ -521,7 +1195,51 @@ def resolve_bundle_info_from_app(app_path):
     )
 
 
+def _read_plist_via_cli(plist_path):
+    """Shell to `bugsee-cli build-env read-plist` for the full
+    top-level key/value dict. Returns the dict on success, or
+    None on any CLI failure (binary not on PATH, non-zero exit,
+    malformed JSON, OSError).
+
+    The dict on success is authoritative — a missing key in the
+    returned dict means the plist truly doesn't contain it; the
+    caller does NOT fall back to PlistBuddy in that case."""
+    cli = _resolve_cli()
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "build-env", "read-plist", plist_path],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (OSError, ValueError):
+        return None
+
+
 def _plist_value(plist_path, key):
+    """Read a single top-level key from an Info.plist.
+
+    Prefers `bugsee-cli build-env read-plist` (canonical Rust
+    implementation). When the CLI succeeds, the parsed dict is
+    authoritative — a missing key in the dict returns None and
+    does NOT trigger the PlistBuddy fallback (the file genuinely
+    doesn't contain that key). The fallback only fires when the
+    CLI itself isn't available."""
+    cli_dict = _read_plist_via_cli(plist_path)
+    if cli_dict is not None:
+        v = cli_dict.get(key)
+        if v is None or v == "":
+            return None
+        return v
     try:
         result = subprocess.run(
             ['/usr/libexec/PlistBuddy', '-c', 'Print :%s' % key, plist_path],
@@ -542,6 +1260,25 @@ def _plist_value(plist_path, key):
 # usable identifier. The trailing fallback is "whatever slice came
 # first", which covers exotic build configurations.
 _PREFERRED_MACHO_ARCHS = ('arm64', 'arm64e', 'x86_64', 'arm64-simulator', 'x86_64-simulator')
+
+
+def _normalise_build_uuid(raw):
+    """Coerce a Mach-O LC_UUID string to the canonical wire format the
+    back-end uses for `crash.uuid → build.uuid` join: 32 lowercase hex
+    chars, no dashes, no whitespace. Matches the iOS runtime SDK's
+    `BGSCrashReport.m` shape verbatim. Returns None on empty or
+    whitespace-only input so callers never write a meaningless uuid
+    into the registration payload.
+
+    Mirrors the fastlane plugin BugseeAgent's `_normalise_build_uuid`
+    byte-for-byte so both producers emit IDENTICAL canonical uuids
+    for the same input — without this, adversarial CLI output
+    (`'  '`, `'-'`, whitespace-padded UUIDs) would diverge between
+    the two producers and break the back-end's crash-join."""
+    if not raw:
+        return None
+    candidate = str(raw).replace('-', '').strip().lower()
+    return candidate or None
 
 
 def get_main_executable_uuid(app_path):
@@ -586,29 +1323,7 @@ def get_main_executable_uuid(app_path):
     if not os.path.isfile(binary_path):
         return None
 
-    try:
-        result = subprocess.run(
-            ['/usr/bin/dwarfdump', '-u', binary_path],
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-
-    # `dwarfdump -u` output lines look like:
-    #   UUID: 12345678-1234-1234-1234-123456789012 (arm64) /path/to/binary
-    # One line per Mach-O slice. Parse into (arch → uuid) and pick
-    # the best-matching arch.
-    slices = {}
-    pattern = re.compile(r'^\s*UUID:\s*([0-9A-Fa-f-]+)\s*\(([^)]+)\)')
-    for line in (result.stdout or '').splitlines():
-        m = pattern.match(line)
-        if m:
-            uuid_str = m.group(1)
-            arch = m.group(2).strip()
-            slices[arch] = uuid_str
-
+    slices = _load_macho_slices(binary_path)
     if not slices:
         return None
 
@@ -623,16 +1338,144 @@ def get_main_executable_uuid(app_path):
         # exotic-multi-arch case.
         selected = next(iter(slices.values()))
 
-    # Normalise to lowercase hex, no dashes, matching the iOS SDK's
-    # `[NSString stringWithFormat:@"%02X..."] lowercaseString` shape.
-    return selected.replace('-', '').lower()
+    # Route through the lifted choke-point helper so the shape
+    # contract (32 lowercase hex chars, no dashes, no whitespace) is
+    # enforced uniformly across both producers. Adversarial CLI
+    # output (`'  '`, `'-'`, whitespace-padded UUIDs, or a falsy
+    # `{'arm64': ''}` slipped in via dict-iteration) now collapses
+    # to None instead of leaking into the build registration body.
+    return _normalise_build_uuid(selected)
+
+
+# -----------------------------------------------------------------
+# Mach-O slice loader — shared between `get_main_executable_uuid`
+# and any future consumer that needs `arch → uuid` per slice.
+# -----------------------------------------------------------------
+
+def _load_macho_slices_via_cli(binary_path):
+    """Shell to `bugsee-cli dsym slices <binary>`. Returns the slice
+    dict `{arch: uuid_hyphenated_upper}` on success or `None` when
+    the CLI cannot be invoked / produces unparseable output.
+
+    Empty list from the CLI is authoritative — returns `{}` so the
+    caller treats it identically to "no slices found" without
+    falling through to dwarfdump."""
+    if not binary_path:
+        return None
+    cli = _resolve_cli()
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "dsym", "slices", binary_path],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        if not isinstance(data, list):
+            return None
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return None
+    slices = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        uuid_str = entry.get('uuid')
+        arch = entry.get('arch')
+        if not isinstance(uuid_str, str) or not isinstance(arch, str):
+            continue
+        # First-seen-wins matches dwarfdump dict-construction order
+        # (later slices for the same arch are exotic — multi-fat
+        # archive with duplicate arch entries — and the iOS runtime
+        # would pick the same slice the loader chose).
+        if arch not in slices:
+            slices[arch] = uuid_str
+    return slices
+
+
+def _load_macho_slices_via_dwarfdump(binary_path):
+    """Run `/usr/bin/dwarfdump -u <binary>` and parse its output into
+    a `{arch: uuid_hyphenated}` dict. Returns `None` on shell
+    failure, `{}` when the binary parsed but had no UUID lines."""
+    try:
+        result = subprocess.run(
+            ['/usr/bin/dwarfdump', '-u', binary_path],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    # `dwarfdump -u` output lines look like:
+    #   UUID: 12345678-1234-1234-1234-123456789012 (arm64) /path/to/binary
+    # One line per Mach-O slice. Parse into (arch → uuid).
+    slices = {}
+    pattern = re.compile(r'^\s*UUID:\s*([0-9A-Fa-f-]+)\s*\(([^)]+)\)')
+    for line in (result.stdout or '').splitlines():
+        m = pattern.match(line)
+        if m:
+            uuid_str = m.group(1)
+            arch = m.group(2).strip()
+            slices[arch] = uuid_str
+    return slices
+
+
+def _load_macho_slices(binary_path):
+    """Resolve a Mach-O binary's `(arch → uuid)` slice map.
+
+    Prefers `bugsee-cli dsym slices` (single canonical Rust impl
+    keyed off `symbolic-debuginfo`, see
+    `bugsee-cli/src/cli/dsym.rs`) when the CLI is on PATH; falls
+    back to the in-process `/usr/bin/dwarfdump -u` shell-out
+    otherwise.
+
+    Returns `None` when no usable extractor produces a result (so
+    the caller can decide whether to abort or synthesize); returns
+    `{}` when an extractor parsed the binary but found no UUID
+    slices (rare but possible for stripped binaries)."""
+    via_cli = _load_macho_slices_via_cli(binary_path)
+    if via_cli is not None:
+        return via_cli
+    return _load_macho_slices_via_dwarfdump(binary_path)
+
+
+def _resolve_xcode_version_via_cli():
+    """Shell to `bugsee-cli build-env xcode-version`. Returns the
+    trimmed stdout or None. Part of the Option-C migration that
+    moved canonical build-env helpers to the Rust CLI."""
+    cli = _resolve_cli()
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "build-env", "xcode-version"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        return out if out else None
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return None
 
 
 def resolve_xcode_version():
     """Returns the short Xcode version (e.g. `"16.2"`) or None. Tries
     `$XCODE_VERSION_ACTUAL` first (set in every Run Script env —
     numeric like `1620`, needs reformatting), then falls back to
-    `xcodebuild -version` which is slow but ground-truth."""
+    `xcodebuild -version` which is slow but ground-truth.
+
+    Prefers `bugsee-cli build-env xcode-version` (single cross-
+    language source of truth). Falls back to the in-process
+    Python below when the CLI isn't installed."""
+    via_cli = _resolve_xcode_version_via_cli()
+    if via_cli is not None:
+        return via_cli
+
     actual = os.environ.get('XCODE_VERSION_ACTUAL')
     if actual and actual.isdigit():
         # "1620" → "16.2.0" ; "1543" → "15.4.3"
@@ -930,6 +1773,140 @@ def _put_timings_blob(url, gz_bytes, debug=False):
     return False
 
 
+def _upload_build_info_bundle(upload_url, deps_gz, timings_gz):
+    """Ship the build-info components as ONE bundle via
+    `bugsee-cli upload build-info --upload-url <url>` (pre-signed mode:
+    the build is already registered/submitted, so the CLI just PUTs).
+
+    `deps_gz` / `timings_gz` are the gzipped per-blob payloads; they're
+    gunzipped here because the bundle's `dependencies.json` /
+    `timings.json` entries carry RAW JSON (the CLI does the zstd packing
+    and the worker re-gzips on store, so the stored bytes match the
+    legacy per-blob path). At least one must be non-None.
+
+    Returns True on success. Returns False on ANY failure — including no
+    usable `bugsee-cli` — so the caller falls back to the legacy
+    per-blob gzip PUTs (independent presigned URLs, worth retrying even
+    on a substantive bundle failure).
+
+    CLI resolution mirrors the other CLI helpers in this file
+    (`_resolve_cli()`, which enforces a `>= BUGSEE_CLI_MIN_VERSION` floor
+    over BUGSEE_CLI_PATH / PATH). Unlike the fastlane plugin's
+    `resolveCli(...)`, this never auto-downloads — a too-old or absent CLI
+    just means the Python fallback runs.
+    """
+    cli = _resolve_cli()
+    if not cli:
+        return False
+    tmpdir = tempfile.mkdtemp(prefix='bugsee-build-info-')
+    try:
+        argv = [cli, "upload", "build-info", "--upload-url", upload_url]
+        if deps_gz is not None:
+            deps_path = os.path.join(tmpdir, "dependencies.json")
+            with open(deps_path, 'wb') as fp:
+                fp.write(gzip.decompress(deps_gz))
+            argv += ["--deps", deps_path]
+        if timings_gz is not None:
+            timings_path = os.path.join(tmpdir, "timings.json")
+            with open(timings_path, 'wb') as fp:
+                fp.write(gzip.decompress(timings_gz))
+            argv += ["--timings", timings_path]
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=120, check=False)
+        stderr = (result.stderr or '').strip()
+        if stderr:
+            print("Bugsee: bugsee-cli output:\n%s" % stderr)
+        return result.returncode == 0
+    except _CLI_CATCHALL_EXCEPTIONS as e:
+        print("Bugsee: build-info bundle CLI invocation failed: %s" % e)
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _upload_build_via_cli(endpoint, app_token, ipa_path, payload,
+                          deps_gz=None, timings_gz=None, chunked=False, debug=False):
+    """Run `bugsee-cli upload build` — the converged registration + artefact
+    upload (single or chunked) + build-info bundle in ONE invocation, mirroring
+    the Gradle plugin's BundleUploadTask CLI-primary path.
+
+    The CLI registers the build (POST `/v2/apps/<token>/builds`, injecting
+    `request_artifact_upload`, and `request_build_info_upload` when
+    `--deps`/`--timings` are passed), reads the presigned artefact endpoint +
+    build_id, packs the .ipa STORED in a wrapper ZIP, PUTs it (single or, with
+    `--chunked`, multipart), and ships the build-info bundle from the same
+    registration. The worker detects the `.ipa` entry inside the wrapper ZIP,
+    so this is wire-compatible with the native Python path.
+
+    `deps_gz` / `timings_gz` are gunzipped to RAW JSON (the CLI does its own
+    packing) exactly like `_upload_build_info_bundle`.
+
+    Returns (succeeded, should_fallback):
+      - no resolvable bugsee-cli (>= floor)                     -> (False, True)
+      - exit 0                                                  -> (True, False)
+      - exit 1 / 2 (structural: usage/unexpected/exec failure)  -> (False, True)
+      - any other non-zero (substantive server-side failure)    -> (False, False)
+
+    `should_fallback` True means "the CLI did not handle this — run the native
+    Python path". A substantive failure (server rejected) returns
+    `(False, False)`: retrying the same registration against the same endpoint
+    would just reproduce the error. Never raises.
+    """
+    cli = _resolve_cli()
+    if not cli:
+        return (False, True)
+    tmpdir = tempfile.mkdtemp(prefix='bugsee-upload-build-')
+    try:
+        payload_path = os.path.join(tmpdir, "payload.json")
+        with open(payload_path, 'w') as fp:
+            json.dump(payload, fp)
+        argv = [cli, "--endpoint", endpoint, "--app-token", app_token,
+                "upload", "build",
+                "--payload-json", payload_path,
+                "--artifact", ipa_path]
+        if deps_gz is not None:
+            deps_path = os.path.join(tmpdir, "dependencies.json")
+            with open(deps_path, 'wb') as fp:
+                fp.write(gzip.decompress(deps_gz))
+            argv += ["--deps", deps_path]
+        if timings_gz is not None:
+            timings_path = os.path.join(tmpdir, "timings.json")
+            with open(timings_path, 'wb') as fp:
+                fp.write(gzip.decompress(timings_gz))
+            argv += ["--timings", timings_path]
+        if chunked:
+            argv += ["--chunked"]
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=1800, check=False)
+        if debug:
+            stderr = (result.stderr or '').strip()
+            if stderr:
+                print("Bugsee: bugsee-cli (upload build, app %s) output:\n%s"
+                      % (_mask_token(app_token), stderr))
+        rc = result.returncode
+        if rc == 0:
+            return (True, False)
+        if rc in (1, 2):
+            # Structural: usage error / unexpected internal failure / exec
+            # problem. The CLI never reached the server with a valid request,
+            # so the native Python path is worth running.
+            return (False, True)
+        # Any other non-zero is a substantive, server-side rejection (e.g.
+        # 10/20/30). Re-running the same registration via Python would hit the
+        # same endpoint with the same payload and reproduce the failure, so do
+        # NOT fall back.
+        return (False, False)
+    except _CLI_CATCHALL_EXCEPTIONS as e:
+        # Exec/timeout/IO failure — the CLI never produced a verdict, so fall
+        # back to the native Python path.
+        if debug:
+            print("Bugsee: upload build CLI invocation failed (app %s): %s"
+                  % (_mask_token(app_token), e))
+        return (False, True)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def upload_build(endpoint, app_token, ipa_path, payload, debug=False, deps_gz=None,
                  timings_gz=None):
     """Two-stage upload matching the Android Gradle plugin's
@@ -992,13 +1969,33 @@ def upload_build(endpoint, app_token, ipa_path, payload, debug=False, deps_gz=No
     presigned = (result or {}).get('endpoint') if isinstance(result, dict) else None
     requested_artifact_upload = bool(payload.get('request_artifact_upload'))
 
+    # Build-info bundle (Phase D): when the server signed a
+    # `build_info_upload_endpoint` (the org is flagged on), the escape
+    # hatch is off, and a `bugsee-cli` resolves, ship deps+timings as
+    # ONE bundle via `bugsee-cli upload build-info` instead of the two
+    # legacy gzip PUTs below. Fails closed — any miss/failure leaves
+    # `bundled` False so the legacy per-blob PUTs run as before.
+    bundled = False
+    build_info_url = (result or {}).get('build_info_upload_endpoint') if isinstance(result, dict) else None
+    if (build_info_url
+            and not _env_truthy(os.environ.get('BUGSEE_LEGACY_BUILDINFO_GZIP'))
+            and (deps_gz or timings_gz)):
+        if _upload_build_info_bundle(build_info_url, deps_gz, timings_gz):
+            bundled = True
+            if debug:
+                print("Bugsee: build-info bundle uploaded via bugsee-cli.")
+        else:
+            print("Bugsee: build-info bundle unavailable/failed; falling "
+                  "back to legacy per-blob upload.")
+
     # Dependency blob — independent of the artefact. The server signs a
     # `dependencies_upload_endpoint` whenever the POST carried
     # `request_dependencies_upload: true`, regardless of whether an
     # artefact upload was also requested. PUT it here, BEFORE the
     # build-info-only early-return below, so deps ship on every path
     # (build-info-only included). Best-effort — never fails the build.
-    if deps_gz:
+    # Skipped when the converged bundle already shipped it.
+    if deps_gz and not bundled:
         deps_url = (result or {}).get('dependencies_upload_endpoint') if isinstance(result, dict) else None
         if deps_url:
             _put_dependencies_blob(deps_url, deps_gz, debug=debug)
@@ -1010,7 +2007,8 @@ def upload_build(endpoint, app_token, ipa_path, payload, debug=False, deps_gz=No
     # whenever the POST carried `request_timings_upload: true`. PUT it
     # here, BEFORE the build-info-only early-return below, so the Gantt
     # blob ships on every path (build-info-only included). Best-effort.
-    if timings_gz:
+    # Skipped when the converged bundle already shipped it.
+    if timings_gz and not bundled:
         timings_url = (result or {}).get('timings_upload_endpoint') if isinstance(result, dict) else None
         if timings_url:
             _put_timings_blob(timings_url, timings_gz, debug=debug)
@@ -1429,12 +2427,34 @@ def try_chunked_upload(endpoint, app_token, ipa_path, payload, debug=False, deps
         return False
     build_id = result.get('build_id')
 
+    # Build-info bundle (Phase D) — symmetry with the single-PUT
+    # `upload_build` path. NOTE: the appserver's chunked-submit
+    # (`/chunked`) path does NOT yet sign a `build_info_upload_endpoint`,
+    # so `build_info_url` is None here today and this branch is inert —
+    # the flow falls through to the legacy per-blob PUTs below (fails
+    # closed, by design). Wired anyway so that when the chunked submit
+    # starts signing the endpoint, this path converges with the
+    # single-PUT flow and the Gradle plugin without a code change.
+    bundled = False
+    build_info_url = result.get('build_info_upload_endpoint')
+    if (build_info_url
+            and not _env_truthy(os.environ.get('BUGSEE_LEGACY_BUILDINFO_GZIP'))
+            and (deps_gz or timings_gz)):
+        if _upload_build_info_bundle(build_info_url, deps_gz, timings_gz):
+            bundled = True
+            if debug:
+                print("Bugsee: build-info bundle uploaded via bugsee-cli.")
+        else:
+            print("Bugsee: build-info bundle unavailable/failed; falling "
+                  "back to legacy per-blob upload.")
+
     # Dependency blob — PUT only after a successful chunked submit, so
     # it never double-fires with the single-PUT fallback (on submit
     # failure we return False above and `upload_build` does its own
     # metadata POST + deps PUT). Best-effort; a failed deps PUT does
     # not fail the otherwise-successful chunked artefact upload.
-    if deps_gz:
+    # Skipped when the converged bundle already shipped it.
+    if deps_gz and not bundled:
         deps_url = result.get('dependencies_upload_endpoint')
         if deps_url:
             _put_dependencies_blob(deps_url, deps_gz, debug=debug)
@@ -1445,7 +2465,8 @@ def try_chunked_upload(endpoint, app_token, ipa_path, payload, debug=False, deps
     # after a successful chunked submit so it never double-fires with
     # the single-PUT fallback. Best-effort; a failed timings PUT does
     # not fail the otherwise-successful chunked artefact upload.
-    if timings_gz:
+    # Skipped when the converged bundle already shipped it.
+    if timings_gz and not bundled:
         timings_url = result.get('timings_upload_endpoint')
         if timings_url:
             _put_timings_blob(timings_url, timings_gz, debug=debug)
@@ -2807,7 +3828,8 @@ def run_size_analysis_flow(app_token):
         print("Bugsee: no .app found — checked ARCHIVE_PATH=%r and "
               "TARGET_BUILD_DIR=%r. Skipping build-publish upload."
               % (archive_path, target_build_dir))
-        return
+        # Tuple shape — bytes_shipped, size_check_exit_code.
+        return (False, None)
 
     bundle_id, version, build_number = resolve_bundle_info_from_app(app_path)
 
@@ -2858,7 +3880,14 @@ def run_size_analysis_flow(app_token):
         # `uuid.uuid4()` if extraction fails — the build record is
         # still useful in the dashboard, just without crash-context
         # join.
-        build_uuid = get_main_executable_uuid(app_path) or str(uuid.uuid4())
+        # Normalise both cascade arms to the canonical 32-char
+        # lowercase-no-dash shape. `get_main_executable_uuid` already
+        # routes through `_normalise_build_uuid`; the uuid4 fallback
+        # returns hyphenated form, so funnel it through the helper
+        # too so the wire shape stays uniform regardless of which
+        # arm fired.
+        build_uuid = (get_main_executable_uuid(app_path)
+                      or _normalise_build_uuid(str(uuid.uuid4())))
         payload = {
             'uuid': build_uuid,
             'format': 'ipa',
@@ -2962,6 +3991,16 @@ def run_size_analysis_flow(app_token):
                 # the upload path PUTs nothing.
                 deps_gz = None
 
+        # Opt into the converged build-info bundle (Phase D). The server
+        # only signs a `build_info_upload_endpoint` when the org's
+        # feature flag is on; the per-blob `request_dependencies_upload`
+        # / `request_timings_upload` flags above stay set so the legacy
+        # path remains available for fallback (and non-flagged orgs)
+        # during the soak. Matches the truthiness of the per-blob gates:
+        # set whenever a deps OR timings blob is present.
+        if deps_gz or timings_gz:
+            payload['request_build_info_upload'] = True
+
         debug = _env_truthy(env.get('BUGSEE_SIZE_ANALYSIS_DEBUG'))
 
         # Size-check preparation runs BEFORE `upload_build` so the
@@ -2992,26 +4031,70 @@ def run_size_analysis_flow(app_token):
             payload.get('request_artifact_upload')
             and _env_truthy(env.get('BUGSEE_CHUNKED_UPLOAD'))
         )
-        chunked_succeeded = False
-        if chunked_requested:
-            chunked_succeeded = try_chunked_upload(
-                endpoint, app_token, ipa_path, payload, debug=debug,
-                deps_gz=deps_gz, timings_gz=timings_gz
-            )
-            if not chunked_succeeded:
-                print("Bugsee: chunked upload failed — falling back to single-PUT")
 
-        if not chunked_succeeded:
-            upload_build(endpoint, app_token, ipa_path, payload, debug=debug,
-                         deps_gz=deps_gz, timings_gz=timings_gz)
+        # CLI-primary: `bugsee-cli upload build` (registration + artefact
+        # single/chunked + build-info bundle) when an artefact upload is
+        # requested. Falls back to the native Python path on a STRUCTURAL CLI
+        # failure (missing/too-old binary, usage error) — mirrors
+        # BundleUploadTask's CLI-primary + native-fallback contract. A
+        # substantive CLI failure (server rejected) is NOT retried via Python
+        # (same endpoint, same error). Build-info-only flows
+        # (request_artifact_upload=False) skip the CLI — `upload build`
+        # requires an artefact — and use the existing Python path unchanged.
+        cli_succeeded = False
+        cli_handled = False
+        if payload.get('request_artifact_upload'):
+            cli_succeeded, cli_should_fallback = _upload_build_via_cli(
+                endpoint, app_token, ipa_path, payload, deps_gz=deps_gz,
+                timings_gz=timings_gz, chunked=chunked_requested, debug=debug)
+            cli_handled = cli_succeeded or not cli_should_fallback
+
+        chunked_succeeded = False
+        single_put_succeeded = False
+        if not cli_handled:
+            if chunked_requested:
+                chunked_succeeded = try_chunked_upload(
+                    endpoint, app_token, ipa_path, payload, debug=debug,
+                    deps_gz=deps_gz, timings_gz=timings_gz
+                )
+                if not chunked_succeeded:
+                    print("Bugsee: chunked upload failed — falling back to single-PUT")
+            if not chunked_succeeded:
+                single_put_succeeded = bool(upload_build(
+                    endpoint, app_token, ipa_path, payload, debug=debug,
+                    deps_gz=deps_gz, timings_gz=timings_gz,
+                ))
+
+        # Outcome calculation happens BEFORE the in-build size-check
+        # so that a size-FAIL SystemExit (below) can't corrupt the
+        # bytes-shipped truth the caller needs for the handshake
+        # manifest.
+        #
+        # Build-info-only flows (request_artifact_upload=False)
+        # never ship bytes regardless of upload outcome — fastlane's
+        # equivalent action should still run on top.
+        bytes_shipped = (
+            bool(payload.get('request_artifact_upload'))
+            and (cli_succeeded or chunked_succeeded or single_put_succeeded)
+        )
 
         # In-build size-check evaluation. Runs regardless of upload
         # outcome — the check only needs the local size + the
         # baseline fetched above, so a failed upload doesn't prevent
-        # the user from learning their artefact grew. On FAIL the
-        # function terminates the daemon with `sys.exit(1)`.
+        # the user from learning their artefact grew. On FAIL
+        # `run_size_check` calls sys.exit(1). Catch the SystemExit
+        # here and surface the deferred exit code in the return
+        # tuple so the caller can write the cross-producer manifest
+        # BEFORE the daemon terminates — without this the manifest
+        # is never written and fastlane re-uploads redundantly.
+        size_check_exit_code = None
         if artifact_size > 0:
-            run_size_check(sc_thresholds, sc_baseline, artifact_size)
+            try:
+                run_size_check(sc_thresholds, sc_baseline, artifact_size)
+            except SystemExit as e:
+                size_check_exit_code = e.code if e.code is not None else 1
+
+        return (bytes_shipped, size_check_exit_code)
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -3155,7 +4238,15 @@ _DEPS_MAX_COUNT = 5000
 # iOS lockfiles are the fully-resolved graph; a fixed scope label keeps
 # the back-end's build-over-build compatibility check ("same scope =
 # comparable") satisfied across iOS builds.
-_DEPS_COLLECTION_SCOPE = "resolved"
+#
+# Value aligned with the bugsee-cli's CollectResult.scope_label
+# default (`"all"`) and the fastlane plugin's fallback. The historic
+# SDK-side literal was `"resolved"` and diverged from both other
+# producers — same project produced different `scope` values across
+# CLI-on/CLI-off paths AND across SDK/fastlane producers, silently
+# breaking the worker's diff-compatibility check that pins the field
+# across builds.
+_DEPS_COLLECTION_SCOPE = "all"
 
 
 def _dep_entry(name, version, ecosystem, direct, url=None):
@@ -3390,6 +4481,80 @@ def collect_dependencies(env):
         return None, None
 
 
+def _collect_deps_via_cli(root, max_entries, product_binary=None):
+    """Shell to `bugsee-cli ios-deps collect` for the parsing +
+    dedup + truncation step.
+
+    Part of the Option-C migration that moved iOS dep parsing to
+    the Rust CLI as the single canonical implementation. The
+    in-process Python parsers below are preserved as a cold-
+    start fallback.
+
+    Returns `(deduped_entries, truncated)` on success, or None on
+    any failure (CLI not on PATH, non-zero exit, malformed JSON,
+    OSError). The caller falls back to the Python parsers below
+    on None.
+
+    `product_binary`, when provided, is passed through as
+    `--product-binary` so the CLI's `parse_vendored_frameworks`
+    pass can scan the linked binary's load commands for vendored
+    `.framework` references. Without this flag, vendored
+    frameworks are silently absent from the dep list — the
+    fastlane plugin's parity helper already passes it; the SDK
+    side used to not.
+    """
+    cli = _resolve_cli()
+    if not cli:
+        return None
+    argv = [cli, "ios-deps", "collect",
+            "--project-root", root,
+            "--max-entries", str(max_entries)]
+    if product_binary:
+        argv += ["--product-binary", product_binary]
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        # Shape validation. The fastlane parity test pinned the
+        # `entries` key contract; the SDK side used to skip the
+        # type check, so a future CLI shape change (e.g. accidental
+        # `"entry"` rename, or list-instead-of-dict) would silently
+        # produce zero deps without surfacing a parse error.
+        if not isinstance(data, dict):
+            return None
+        raw_entries = data.get("entries")
+        if not isinstance(raw_entries, list):
+            return None
+        entries = [e for e in raw_entries if isinstance(e, dict)
+                                            and isinstance(e.get("id"), str)]
+        truncated = bool(data.get("truncated"))
+        # `scope_label` is part of the CLI's wire contract (see the
+        # README's wire-shape compat policy and the docstring on
+        # CollectResult in bugsee-cli/src/cli/ios_deps.rs). Propagate
+        # the CLI's value into the summary instead of hardcoding
+        # `_DEPS_COLLECTION_SCOPE` (currently "all", aligned with
+        # the CLI default and the fastlane plugin's fallback). Even
+        # though both values converge on "all" today, propagating
+        # the CLI's value is forward-compatible with the planned
+        # `--scope=runtime_direct_only` mode the Android Gradle
+        # plugin already supports. Fall back to the local default
+        # only when the CLI omits the field (older CLI versions).
+        scope_label = data.get("scope_label")
+        if not isinstance(scope_label, str) or not scope_label:
+            scope_label = _DEPS_COLLECTION_SCOPE
+        return (entries, truncated, scope_label)
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return None
+
+
 def _collect_dependencies_impl(env):
     """Locate + parse the project's CocoaPods / SPM / Carthage lockfiles
     under the source root and build the deps blob + inline summary.
@@ -3398,9 +4563,52 @@ def _collect_dependencies_impl(env):
     lockfile is present or nothing parsed. Best-effort PER MANAGER — a
     parse failure on one manager skips only that manager (see
     `_safe_parse`); the broad catch-all guard lives in the
-    [collect_dependencies] wrapper above."""
+    [collect_dependencies] wrapper above.
+
+    Implementation: prefers `bugsee-cli ios-deps collect` when the
+    binary is on PATH (the single cross-language source of truth,
+    ported from this Python implementation — see
+    `bugsee-cli/src/cli/ios_deps.rs`). Falls back to the
+    in-process Python parsers when the CLI isn't installed. The
+    wire-shape formatting (`_deps_summary` + `_deps_blob_gz`)
+    stays Python on this side — the CLI handles the parse +
+    dedup + truncation step only, returning the deduped entry
+    list for the formatters to consume.
+    """
     root = (env.get('PROJECT_DIR') or env.get('SRCROOT')
             or env.get('SOURCE_ROOT') or os.getcwd())
+
+    # Resolve the product binary (the linked main Mach-O) so the CLI
+    # can detect vendored frameworks from the binary's load commands.
+    # Without this, the CLI's `parse_vendored_frameworks` pass never
+    # runs and `.framework` references bundled with the app are
+    # silently absent from the dep list — a parity bug between this
+    # SDK path and the fastlane plugin path.
+    product_binary = None
+    app_path = find_app_in_build_dir(env)
+    if app_path:
+        exec_name = (env.get('EXECUTABLE_NAME') or '').strip()
+        candidate = os.path.join(app_path, exec_name) if exec_name else None
+        if candidate and os.path.isfile(candidate):
+            product_binary = candidate
+
+    via_cli = _collect_deps_via_cli(root, _DEPS_MAX_COUNT,
+                                    product_binary=product_binary)
+    if via_cli is not None:
+        deduped, truncated, scope_label = via_cli
+        if not deduped:
+            return None, None
+        collection_config = {
+            # Use the CLI's scope_label verbatim so CLI-on and CLI-off
+            # paths emit the same `scope` field value for the same
+            # project (worker pins the field across builds for diff-
+            # compatibility — drift would silently break that check).
+            'scope': scope_label,
+            'include_selected_reason': False,
+            'max_count': _DEPS_MAX_COUNT,
+        }
+        return (_deps_summary(deduped, truncated, collection_config),
+                _deps_blob_gz(deduped, truncated, collection_config))
 
     entries = []
     entries += _safe_parse(os.path.join(root, 'Podfile.lock'), _parse_podfile_lock)
@@ -3443,6 +4651,88 @@ def _collect_dependencies_impl(env):
             _deps_blob_gz(deduped, truncated, collection_config))
 
 
+def _write_build_actions_manifest(
+    out_path, agent_version, build_id, produced_at_ms,
+    version_name, version_code,
+    dsym_upload, mapping_upload, deps_collection, timings,
+    size_analysis,
+    artifact_upload=False,
+):
+    """Write the cross-producer handshake manifest. Read by the Bugsee
+    fastlane plugin (`fastlane-plugin-bugsee/lib/fastlane/plugin/
+    bugsee/helper/bugsee_handshake.rb`) so it can skip per-action
+    work this BugseeAgent already did for the build.
+
+    Cross-repo contract:
+
+      - `schema_version` MUST be `1` to match the fastlane reader.
+        A bump here MUST be coordinated with the reader AND every
+        other producer (the Bugsee Android Gradle plugin).
+      - `producer` is the literal `"bugsee-ios-sdk-tools-bundle"` —
+        the fastlane reader logs this verbatim so a customer can
+        attribute skip decisions back to a specific producer.
+      - The `actions` keys + Boolean values are pinned. A `true`
+        means this agent was configured to handle the action
+        (regardless of whether it ultimately succeeded — fastlane
+        should not retry behind us). The fastlane reader compares
+        `actions[name] == true` strictly; non-Boolean values are
+        treated as not-handled.
+
+    Best-effort: any failure here logs but does NOT propagate. The
+    upload payload already landed on the server (or didn't); a
+    missing handshake manifest at worst makes fastlane do
+    redundant work which the server dedupes by hash.
+    """
+    try:
+        parent = os.path.dirname(out_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        manifest = {
+            "schema_version": 1,
+            "producer": "bugsee-ios-sdk-tools-bundle",
+            "produced_at_ms": int(produced_at_ms),
+            "actions": {
+                "dsym_upload":     bool(dsym_upload),
+                "mapping_upload":  bool(mapping_upload),
+                "deps_collection": bool(deps_collection),
+                "timings":         bool(timings),
+                "size_analysis":   bool(size_analysis),
+                # `artifact_upload` is the cross-producer handshake
+                # key the fastlane plugin's upload_artifact_to_bugsee
+                # action checks before shelling to its own packager.
+                #
+                # OUTCOME flag — True only when the IPA bytes were
+                # actually shipped to S3 end-to-end (chunked OR
+                # single-PUT upload completed). False on every other
+                # outcome: request_artifact_upload=False (build-info-
+                # only registration), upload failure mid-flow,
+                # exception during flow, daemon early-exit, etc.
+                #
+                # Distinct from `size_analysis` above which tracks
+                # the user's INTENT (env var) BEFORE the flow ran.
+                # A run that started with intent but the upload
+                # failed must NOT claim `artifact_upload: true` —
+                # fastlane would skip its own retry and the bytes
+                # would never reach S3.
+                "artifact_upload": bool(artifact_upload),
+            },
+        }
+        # Optional fields — emit only when non-empty so absence stays
+        # distinguishable from "known empty" on the reader side.
+        if agent_version:
+            manifest["producer_version"] = str(agent_version)
+        if build_id:
+            manifest["build_id"] = str(build_id)
+        if version_name:
+            manifest["version_name"] = str(version_name)
+        if version_code is not None and str(version_code) != "":
+            manifest["version_code"] = str(version_code)
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, separators=(',', ':'))
+    except Exception as e:
+        print("Bugsee: failed to write build-actions manifest: %s" % e)
+
+
 def main():
     """Entry-point dispatcher. Runs the dSYM upload (legacy default)
     when the preflight passes, and the build-publish flow (build-info
@@ -3452,7 +4742,93 @@ def main():
     still runs."""
     app_token = args[0]
 
-    if should_run_dsym_flow():
+    # Track what each flow handled for the cross-producer handshake
+    # manifest written at the end of main().
+    #
+    # MOST flags below (dsym_handled, deps_handled, timings_handled,
+    # size_analysis_handled) track INTENT — i.e. DSL/preflight
+    # configuration (which actions this agent was configured to
+    # attempt). fastlane should not retry behind us on a partial
+    # failure of those.
+    #
+    # `artifact_upload_handled` is the EXCEPTION — it tracks OUTCOME
+    # (whether bytes were actually shipped to S3 end-to-end). The
+    # fastlane plugin's upload_artifact_to_bugsee action uses this
+    # key to decide whether to run its own upload; an intent-only
+    # flag would silently skip the retry on a mid-flow failure
+    # (network / signing / disk) and the bytes would never reach
+    # the back-end. The flag is computed inside
+    # `run_size_analysis_flow` BEFORE the size-check runs, so a
+    # post-upload size-FAIL doesn't corrupt the truth.
+    dsym_handled = False
+    deps_handled = False
+    timings_handled = False
+    size_analysis_handled = False
+    artifact_upload_handled = False
+    # Deferred exit code from `run_size_check` (size-FAIL exits the
+    # daemon with sys.exit(1)). Captured here so the manifest write
+    # below still fires; the actual sys.exit is re-raised AFTER the
+    # write so fastlane's handshake reader sees an accurate manifest
+    # even when the size-check trips.
+    size_check_exit_code = None
+
+    # CLI-PRIMARY (Option-A bootstrapper): when a new-enough `bugsee-cli`
+    # is resolvable, delegate the ENTIRE build-publish + dSYM flow to one
+    # command — `bugsee-cli xcode post-action --force-foreground`. The CLI
+    # owns the work (deps, timings, `.ipa` packaging, register, artefact
+    # upload, dSYM upload, size-check); this agent is the bootstrapper +
+    # fallback. We pass `--force-foreground` because THIS agent already
+    # owns the daemon double-fork (see __main__), so the CLI runs
+    # synchronously inside it and hands back the real exit code + its JSON
+    # result report. Falls through to the in-process Python flows below
+    # only on a STRUCTURAL CLI failure (missing / too-old binary, usage
+    # error) — never on a substantive one the Python path would hit too.
+    delegated = False
+    _cli = _resolve_cli()
+    if _cli and _cli_supports_xcode_post_action(_cli):
+        _outcome = _run_xcode_post_action_via_cli(_cli, app_token)
+        if not _outcome['should_fallback']:
+            delegated = True
+            _r = _outcome.get('result')
+            if _r:
+                # The CLI ran the FULL flow and reported its outcomes. Manifest
+                # action flags — semantics chosen PER KEY to match the in-process
+                # path's contract with the fastlane reader (which treats
+                # `actions[name] == true` as "handled, don't run it"):
+                #
+                #   - dsym_upload / artifact_upload: OUTCOME (what the CLI
+                #     actually shipped). These are NOT privacy opt-outs, so a
+                #     `False` safely tells fastlane to (re)run — resilient, and
+                #     never a double (a `True` step already shipped).
+                #     `artifact_upload` MUST stay OUTCOME so a failed upload
+                #     doesn't make fastlane skip its retry.
+                #   - deps_collection / timings: INTENT, always True here
+                #     (exactly like the in-process `deps_handled = timings_handled
+                #     = True`). These ARE privacy opt-outs
+                #     (BUGSEE_DEPENDENCIES_ENABLED / BUGSEE_BUILD_INFO_TIMINGS_
+                #     ENABLED): the delegated flow OWNS them — by collecting OR by
+                #     deliberately honoring the opt-out — so fastlane must not
+                #     re-run them (a `False` would make fastlane collect deps the
+                #     user opted OUT of).
+                #   - size_analysis: the env INTENT, which the CLI echoes back.
+                dsym_handled = bool(_r.get('dsym_uploaded'))
+                deps_handled = True
+                timings_handled = True
+                size_analysis_handled = bool(_r.get('size_analysis'))
+                artifact_upload_handled = bool(_r.get('artifact_uploaded'))
+            # else: a SUBSTANTIVE CLI failure (exit >= 10) with no result report
+            # — the CLI did not successfully handle anything, and we do NOT retry
+            # in-process (the Python path would hit the same error). Every
+            # manifest action stays False so the record reflects "nothing
+            # handled" and fastlane proceeds normally. (A gate-out / no-app run
+            # already returned should_fallback=True above and never reaches here.)
+            size_check_exit_code = _outcome.get('exit_code')
+            if size_check_exit_code is not None:
+                print("Bugsee: size-check FAIL — exit %s deferred until "
+                      "manifest write" % size_check_exit_code)
+
+    if not delegated and should_run_dsym_flow():
+        dsym_handled = True
         try:
             run_dsym_flow(app_token)
         except Exception as e:
@@ -3461,11 +4837,101 @@ def main():
             # for the user to troubleshoot.
             print("Bugsee: dSYM upload failed: %s" % e)
 
-    if should_run_build_publish_flow():
+    if not delegated and should_run_build_publish_flow():
+        # The build-publish flow runs deps collection + timings as
+        # standard side-collections of every registered build (the
+        # `request_dependencies_upload` / `request_timings_upload`
+        # flags on the body are gated independently inside the
+        # flow). Size analysis specifically is opt-in via
+        # BUGSEE_SIZE_ANALYSIS_ENABLED.
+        deps_handled = True
+        timings_handled = True
+        size_analysis_handled = _env_truthy(
+            os.environ.get('BUGSEE_SIZE_ANALYSIS_ENABLED')
+        )
         try:
-            run_size_analysis_flow(app_token)
+            # `run_size_analysis_flow` now returns a 2-tuple:
+            #   `(bytes_shipped, size_check_exit_code)`.
+            # The flow internally catches `SystemExit` from
+            # `run_size_check` (size delta over threshold) and surfaces
+            # the deferred exit code in the tuple so the manifest write
+            # below still fires. The `bytes_shipped` flag is computed
+            # BEFORE the size check runs, so a size-FAIL on a build-info-
+            # only flow (where bytes were never requested) correctly
+            # produces `bytes_shipped=False` regardless of the size
+            # outcome — the back-end's crash-join contract requires
+            # this exact distinction.
+            flow_result = run_size_analysis_flow(app_token)
+            if isinstance(flow_result, tuple):
+                artifact_upload_handled, size_check_exit_code = flow_result
+                artifact_upload_handled = bool(artifact_upload_handled)
+                if size_check_exit_code is not None:
+                    print("Bugsee: size-check FAIL — exit %s deferred until "
+                          "manifest write" % size_check_exit_code)
         except Exception as e:
             print("Bugsee: build upload failed: %s" % e)
+
+    # ──────────────────────────────────────────────
+    # Cross-producer handshake manifest
+    # ──────────────────────────────────────────────
+    # Written at the very end so it reflects the FULL set of
+    # actions this agent attempted for this build. Read by the
+    # Bugsee fastlane plugin when its lane actions run later in
+    # the CI flow.
+    #
+    # Location: $SRCROOT/build/bugsee/build-actions.json. The
+    # fastlane plugin globs `**/build/bugsee/build-actions.json`
+    # under the project root — same pattern as the Bugsee Android
+    # Gradle plugin's `intermediates/bugsee/<variant>/...`.
+    srcroot = (os.environ.get('SRCROOT')
+               or os.environ.get('PROJECT_DIR')
+               or os.getcwd())
+    manifest_path = os.path.join(
+        srcroot, 'build', 'bugsee', 'build-actions.json'
+    )
+    # Read version_name / version_code from Xcode's env vars — set
+    # by every standard build phase. Fall back to the explicit -v /
+    # -b CLI options when env vars aren't populated (e.g.
+    # invocations outside Xcode's run-script-phase environment).
+    version_name = (os.environ.get('MARKETING_VERSION')
+                    or (options.version if options.version else None))
+    version_code = (os.environ.get('CURRENT_PROJECT_VERSION')
+                    or (options.build if options.build else None))
+    _write_build_actions_manifest(
+        out_path        = manifest_path,
+        agent_version   = resolve_agent_version(),
+        # build_id is not consistently available at this stage of
+        # main() and isn't required by the fastlane reader (which
+        # filters by (version_name, version_code) for identity);
+        # omit it rather than emit a partial/inconsistent value.
+        build_id        = None,
+        produced_at_ms  = int(time.time() * 1000),
+        version_name    = version_name,
+        version_code    = version_code,
+        dsym_upload     = dsym_handled,
+        # iOS has no Android-style ProGuard / R8 mapping. Reserved
+        # key for cross-platform symmetry with the Gradle plugin.
+        mapping_upload  = False,
+        deps_collection = deps_handled,
+        timings         = timings_handled,
+        size_analysis   = size_analysis_handled,
+        # `artifact_upload` is the OUTCOME flag — true ONLY when
+        # the bytes were actually shipped to S3 end-to-end. Distinct
+        # from `size_analysis_handled` which tracks the user's intent
+        # (env var) BEFORE the flow ran; a flow that started with
+        # intent but failed (network/signing/disk) must NOT claim
+        # `artifact_upload: true` or the fastlane plugin would
+        # incorrectly skip its own retry.
+        artifact_upload = artifact_upload_handled,
+    )
+
+    # Re-raise the deferred size-check exit AFTER the manifest write.
+    # Without this, `run_size_check`'s `sys.exit(1)` would skip the
+    # entire manifest block above and the fastlane plugin's
+    # handshake reader would see stale / missing data → redundant
+    # uploads.
+    if size_check_exit_code is not None:
+        sys.exit(size_check_exit_code)
 
 
 if __name__ == "__main__":
