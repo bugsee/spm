@@ -832,10 +832,18 @@ def uploadBundle(endpoint, filePath):
     # quotes and a shell-injection sink for the server-returned
     # endpoint URL. urllib was already imported for adjacent
     # requestEndPoint/updateStatus calls; reuse it.
+    #
+    # IMPORTANT: the symbols presigned URL is signed with an EMPTY
+    # Content-Type (matching `curl -T`, which sends none). Python's
+    # urllib defaults a Request(data=...) to
+    # `Content-Type: application/x-www-form-urlencoded`, which makes
+    # S3 return SignatureDoesNotMatch. Pin an empty Content-Type so
+    # the default is suppressed and the signature matches.
     try:
         with open(filePath, 'rb') as f:
             data = f.read()
         req = urllib.request.Request(endpoint, data=data, method='PUT')
+        req.add_header('Content-Type', '')
         with urllib.request.urlopen(req) as resp:
             return 200 <= resp.status < 300
     except Exception:
@@ -4149,58 +4157,71 @@ def run_dsym_flow(app_token):
     zipFileLocation = os.path.join(tempDir, 'symbols.zip')
     dwarfs = []
     uploadedImages = loadUploadedList()
+    # Remember the caller's cwd so we can leave `tempDir` before
+    # deleting it. `os.chdir(options.dsym_folder)` below (list mode
+    # sets that to `tempDir`) would otherwise leave us inside a
+    # directory that `rmtree` removes — subsequent `os.getcwd()` in
+    # `main()` then raises FileNotFoundError.
+    try:
+        previous_cwd = os.getcwd()
+    except OSError:
+        previous_cwd = '/'
 
-    if options.dsym_list:
-        options.dsym_folder = tempDir
-        for f in args[1:]:
-            if (os.path.islink(f)):
+    try:
+        if options.dsym_list:
+            options.dsym_folder = tempDir
+            for f in args[1:]:
+                if (os.path.islink(f)):
+                    continue
+                if (os.stat(f).st_size == 0):
+                    continue
+                with zipfile.ZipFile(f, 'r') as zipf:
+                    zipf.extractall(tempDir)
+
+        os.chdir(options.dsym_folder)
+        for root, dirs, files in os.walk(options.dsym_folder):
+            if not root.endswith('dSYM/Contents/Resources/DWARF'):
                 continue
-            if (os.stat(f).st_size == 0):
-                continue
-            with zipfile.ZipFile(f, 'r') as zipf:
-                zipf.extractall(tempDir)
 
-    os.chdir(options.dsym_folder)
-    for root, dirs, files in os.walk(options.dsym_folder):
-        if not root.endswith('dSYM/Contents/Resources/DWARF'):
-            continue
+            print(root)
+            for f in files:
+                if (os.path.islink(os.path.join(root, f))):
+                    continue
+                if (os.stat(os.path.join(root, f)).st_size == 0):
+                    continue
+                images = parseDSYM(os.path.join(root, f))
+                if (len(images) == 0):
+                    continue
+                if isInUploadedList(images, uploadedImages):
+                    print("Already uploaded %s, skipping" % f)
+                    continue
+                if options.symbol_maps:
+                    deobfuscateDSYM(os.path.join(root, f), options.symbol_maps)
+                dwarfs.append(os.path.join(root, f))
+                uploadedImages.extend(images)
 
-        print(root)
-        for f in files:
-            if (os.path.islink(os.path.join(root, f))):
-                continue
-            if (os.stat(os.path.join(root, f)).st_size == 0):
-                continue
-            images = parseDSYM(os.path.join(root, f))
-            if (len(images) == 0):
-                continue
-            if isInUploadedList(images, uploadedImages):
-                print("Already uploaded %s, skipping" % f)
-                continue
-            if options.symbol_maps:
-                deobfuscateDSYM(os.path.join(root, f), options.symbol_maps)
-            dwarfs.append(os.path.join(root, f))
-            uploadedImages.extend(images)
+        if len(dwarfs) > 0:
+            with zipfile.ZipFile(zipFileLocation, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for dwarf in dwarfs:
+                    zipf.write(dwarf, os.path.relpath(dwarf, options.dsym_folder), zipfile.ZIP_DEFLATED)
 
-    if len(dwarfs) > 0:
-        with zipfile.ZipFile(zipFileLocation, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for dwarf in dwarfs:
-                zipf.write(dwarf, os.path.relpath(dwarf, options.dsym_folder), zipfile.ZIP_DEFLATED)
+                icon = getIcon()
+                if icon:
+                    icon = uncrushIcon(icon, tempDir)
+                if icon and os.path.isfile(icon):
+                    zipf.write(icon, 'icon.png', zipfile.ZIP_DEFLATED)
 
-            icon = getIcon()
-            if icon:
-                icon = uncrushIcon(icon, tempDir)
-            if icon and os.path.isfile(icon):
-                zipf.write(icon, 'icon.png', zipfile.ZIP_DEFLATED)
+                zipf.close()
 
-            zipf.close()
-
-        result = uploadZipFile(app_token, zipFileLocation)
-        if result:
-            saveUploadedList(uploadedImages)
-
-    # cleanup
-    shutil.rmtree(tempDir, ignore_errors=True)
+            result = uploadZipFile(app_token, zipFileLocation)
+            if result:
+                saveUploadedList(uploadedImages)
+    finally:
+        try:
+            os.chdir(previous_cwd)
+        except OSError:
+            os.chdir('/')
+        shutil.rmtree(tempDir, ignore_errors=True)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -4884,8 +4905,15 @@ def main():
     # under the project root — same pattern as the Bugsee Android
     # Gradle plugin's `intermediates/bugsee/<variant>/...`.
     srcroot = (os.environ.get('SRCROOT')
-               or os.environ.get('PROJECT_DIR')
-               or os.getcwd())
+               or os.environ.get('PROJECT_DIR'))
+    if not srcroot:
+        try:
+            srcroot = os.getcwd()
+        except OSError:
+            # `run_dsym_flow` may have chdir'd into a temp dir that was
+            # subsequently removed; fall back rather than crash the
+            # handshake write.
+            srcroot = '/'
     manifest_path = os.path.join(
         srcroot, 'build', 'bugsee', 'build-actions.json'
     )

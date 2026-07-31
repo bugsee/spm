@@ -15,8 +15,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "Bugsee",
-            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-6.3.0.zip",
-            checksum: "8af51d1d8aeecf74c9f4da975de4a661fab18bce85f8ac49f06d7bb3153824ab"),
+            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-6.3.1.zip",
+            checksum: "24221f2154aa7bad7f74f0f31454f5e8c6db34e87b7bbaadef23e87748c23d86"),
         .target(
             name: "BugseeSwiftUI",
             dependencies: ["Bugsee"],
