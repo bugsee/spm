@@ -69,7 +69,7 @@ Text(secret)
     .bugseeProtect()
 ```
 
-`BugseeSwiftUI` requires iOS 13+; on iOS 12 the core `Bugsee` module remains fully usable.
+`BugseeSwiftUI` requires iOS 13+, same as the core `Bugsee` module.
 
 ## Initialization
 
