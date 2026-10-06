@@ -7,17 +7,7 @@ Sign up for a service at [https://www.bugsee.com](https://www.bugsee.com).
 
 ## Installation
 
-**Cocoapods**
-```bash
-pod 'Bugsee'
-```
-
-Run the following commands to install the Pod:
-
-```bash
-pod install
-pod update Bugsee # This is important, install command does not guarantee you will get latest version
-```
+Bugsee requires **iOS 15.0** or later (tvOS 15.0, visionOS 1.0).
 
 **Swift Package Manager**
 
@@ -28,17 +18,17 @@ https://github.com/bugsee/spm
 ```
 and select the latest version.
 
-**Carthage**
-```bash
-binary "https://download.bugsee.com/sdk/ios/dynamic/Bugsee.json"
-```
+**Direct download**
 
-Run the following command to install:
+For integrations that cannot resolve a Swift package — Unity projects, or any
+build that embeds frameworks by hand — download and embed the XCFramework:
 
 ```bash
-carthage update
+https://download.bugsee.com/sdk/ios/dynamic/Bugsee-<version>.xcframework.zip
 ```
 
+CocoaPods and Carthage are no longer supported. Projects still on either one
+should migrate to Swift Package Manager or to the direct download above.
 
 **Import**
 
@@ -69,7 +59,7 @@ Text(secret)
     .bugseeProtect()
 ```
 
-`BugseeSwiftUI` requires iOS 13+; on iOS 12 the core `Bugsee` module remains fully usable.
+`BugseeSwiftUI` requires iOS 15+, same as the core `Bugsee` module.
 
 ## Initialization
 
