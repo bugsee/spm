@@ -1,4 +1,4 @@
-// swift-tools-version:5.3
+// swift-tools-version:5.9
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -6,7 +6,9 @@ import PackageDescription
 let package = Package(
     name: "Bugsee",
     platforms: [
-        .iOS(.v12)
+        .iOS(.v15),
+        .tvOS(.v15),
+        .visionOS(.v1)
     ],
     products: [
         .library(name: "Bugsee", targets: ["Bugsee"]),
@@ -15,8 +17,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "Bugsee",
-            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-6.3.2.zip",
-            checksum: "ee1770dd4a51b8289d2cb74448bba2f7f116554f109c44386275ecd6d467cbee"),
+            url: "https://download.bugsee.com/sdk/ios/spm/Bugsee-7.0.0-beta7.zip",
+            checksum: "21b8209c2541c632b39085702e4b71930cf08673cbe05406cbd0b1783f87043b"),
         .target(
             name: "BugseeSwiftUI",
             dependencies: ["Bugsee"],

@@ -60,11 +60,7 @@ extension View {
     @available(*, deprecated, message: "Use bugseeProtect() or bugseeProtect(isEnabled:) instead. The closure variant will be removed in the future.")
     @ViewBuilder
     public func bugseeProtect(_ completion: @escaping (UIView) -> ()) -> some View {
-        if #available(iOS 26.1, *) {
-            bugseeOverlay261(BugseeProtectedOverlayUIView(completion: completion))
-        } else {
-            bugseeOverlay(BugseeProtectedOverlayUIView(completion: completion))
-        }
+        bugseeOverlay(BugseeProtectedOverlayUIView(completion: completion))
     }
 
     @ViewBuilder
@@ -74,22 +70,10 @@ extension View {
 
     @ViewBuilder
     public func bugseeProtect(isEnabled: Binding<Bool>) -> some View {
-        if #available(iOS 26.1, *) {
-            bugseeOverlay261(BugseeProtectedOverlayUIView(isProtected: isEnabled))
-        } else {
-            bugseeOverlay(BugseeProtectedOverlayUIView(isProtected: isEnabled))
-        }
+        bugseeOverlay(BugseeProtectedOverlayUIView(isProtected: isEnabled))
     }
 
     fileprivate func bugseeOverlay<SomeView>(_ view: SomeView) -> some View where SomeView: View {
-        overlay(GeometryReader{ geometry in
-            view.frame(width: geometry.size.width, height: geometry.size.height)
-                .allowsHitTesting(false)
-        })
-    }
-
-    @available(iOS 26.1, *)
-    fileprivate func bugseeOverlay261<SomeView>(_ view: SomeView) -> some View where SomeView: View {
         overlay {
             GeometryReader { geometry in
                 view.frame(width: geometry.size.width, height: geometry.size.height)
