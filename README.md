@@ -7,17 +7,7 @@ Sign up for a service at [https://www.bugsee.com](https://www.bugsee.com).
 
 ## Installation
 
-**Cocoapods**
-```bash
-pod 'Bugsee'
-```
-
-Run the following commands to install the Pod:
-
-```bash
-pod install
-pod update Bugsee # This is important, install command does not guarantee you will get latest version
-```
+Bugsee requires **iOS 15.0** or later (tvOS 15.0, visionOS 1.0).
 
 **Swift Package Manager**
 
@@ -26,19 +16,37 @@ Navigate to the SPM section in your project, add a new package, point it to
 ```bash
 https://github.com/bugsee/spm
 ```
-and select the latest version.
+and select the latest version. To install a pre-release version (one with a suffix,
+such as `-beta1`), set the dependency rule to **Exact Version**: Swift Package
+Manager keeps pre-release versions out of version ranges, so "Up to Next Major
+Version" resolves only released versions.
 
-**Carthage**
+**Direct download**
+
+For integrations that cannot resolve a Swift package — Unity projects, or any
+build that embeds frameworks by hand — download and embed the XCFramework. This is
+the same archive the Swift package resolves:
+
 ```bash
-binary "https://download.bugsee.com/sdk/ios/dynamic/Bugsee.json"
+https://download.bugsee.com/sdk/ios/spm/Bugsee-<version>.zip
 ```
 
-Run the following command to install:
+The archive also contains a `Tools/` folder with the `BugseeAgent` and `BugseeClean`
+symbol-upload scripts. Keep it inside the folder that contains your `.xcodeproj`,
+where the [dSYM upload script](https://docs.bugsee.com/sdk/ios/symbolication/)
+looks for `BugseeAgent`.
 
-```bash
-carthage update
-```
+CocoaPods and Carthage are no longer supported. Projects still on either one
+should migrate to Swift Package Manager or to the direct download above.
 
+Upgrading from 6.x? Many APIs and every option key changed in 7.x. See the
+[migration guide](https://docs.bugsee.com/sdk/ios/v7/migration/).
+
+**In-app feedback**
+
+The feedback/chat feature ships as a separate package,
+[`BugseeFeedback`](https://github.com/bugsee/feedback-spm). Add it at the same exact
+version as `Bugsee` only if your app uses in-app feedback.
 
 **Import**
 
@@ -69,7 +77,7 @@ Text(secret)
     .bugseeProtect()
 ```
 
-`BugseeSwiftUI` requires iOS 13+; on iOS 12 the core `Bugsee` module remains fully usable.
+`BugseeSwiftUI` requires iOS 15+, same as the core `Bugsee` module.
 
 ## Initialization
 
@@ -89,7 +97,7 @@ Locate your app delegate and initialize the framework in your *application:didFi
 
 **Swift**
 ```swift
-func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplicationLaunchOptionsKey: Any]?) -> Bool {
+func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
     // ...other initialization code
 
     Bugsee.launch(token:"your_app_token")
@@ -111,10 +119,10 @@ Bugsee behavior is very customizable, if default configuration is not satisfying
     // ...other initialization code
 
     NSDictionary * options = @{
-           BugseeMaxRecordingTimeKey   : @60,  
-           BugseeShakeToReportKey      : BugseeTrue,
-           BugseeScreenshotToReportKey : BugseeTrue,
-           BugseeCrashReportKey        : BugseeTrue
+           BugseeOptionConfigDuration               : @60,
+           BugseeOptionReportingTriggerByShake      : BugseeTrue,
+           BugseeOptionReportingTriggerByScreenshot : BugseeTrue,
+           BugseeOptionDetectAndReportCrash         : BugseeTrue
     };
 
     [Bugsee launchWithToken:@"your_app_token" andOptions:options];
@@ -125,16 +133,16 @@ Bugsee behavior is very customizable, if default configuration is not satisfying
 
 **Swift**
 ```swift
-func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplicationLaunchOptionsKey: Any]?) -> Bool {
+func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
     // ...other initialization code
 
     let options : [String: Any] =
-        [ BugseeMaxRecordingTimeKey   : 60,
-          BugseeShakeToReportKey      : false,
-          BugseeScreenshotToReportKey : true,
-          BugseeCrashReportKey        : true ]
+        [ BugseeOptionConfigDuration               : 60,
+          BugseeOptionReportingTriggerByShake      : false,
+          BugseeOptionReportingTriggerByScreenshot : true,
+          BugseeOptionDetectAndReportCrash         : true ]
 
-    Bugsee.launch(token: "your_app_token", options: options)
+    Bugsee.launch(token: "your_app_token", dictionaryOptions: options)
 
     return true
 }
@@ -143,42 +151,145 @@ func application(_ application: UIApplication, didFinishLaunchingWithOptions lau
 ### Available Options
 |Key|Default value|Notes
 |---|---|---|
-|BugseeMaxRecordingTimeKey|@60|Maximum recording duration|
-|BugseeShakeToReportKey|NO|Shake gesture to trigger report|
-|BugseeScreenshotToReportKey|YES|Screenshot key to trigger report|
-|BugseeCrashReportKey|YES|Catch and report application crashes (\*\*)|
+|BugseeOptionConfigDuration|@60|Maximum recording duration, in seconds|
+|BugseeOptionReportingTriggerByShake|YES|Shake gesture to trigger report|
+|BugseeOptionReportingTriggerByScreenshot|NO|Screenshot to trigger report|
+|BugseeOptionDetectAndReportCrash|YES|Catch and report application crashes (\*)|
 
-\* Frame rate depends on a lot of factors including the overall load of the system, we are doing our best not to interfere with the performance of the application hence the frame rate of the video can not be guaranteed, this only sets the upper boundary (i.e its not going to be higher than 15 fps)
+\* iOS allows only one crash detector to be active at a time, if you insist on using an alternative solution for handling crashes, you might want to use this option and disable Bugsee from taking over.
 
-\*\* IOS allows only one crash detector to be active at a time, if you insist on using an alternative solution for handling crashes, you might want to use this option and disable Bugsee from taking over.
+Always pass the `BugseeOption*` constants: a key typed out as a plain string is ignored
+without any warning. The full list of keys is in the
+[migration guide](https://docs.bugsee.com/sdk/ios/v7/migration/#2-option-keys).
 
-### Setting reporters email
+### Setting the user identifier
 
-When you already have your users identified within your app, you might want to add their email automatically attached to the bug report. Bugsee provides API's for setting, getting and clearing the email.
+When you already have your users identified within your app, you might want to attach their identifier (an email address, for example) to every report automatically. Bugsee provides APIs for setting, getting and clearing it.
 
 **Objective-C**
 ```objective-c
-    // setting email
-    [Bugsee setEmail:@"name@example.com"]
+    // setting the identifier
+    [Bugsee setUserIdentifier:@"name@example.com"];
 
-    // getting email, nil will be returned if email was never set
-    NSString *email = [Bugsee getEmail];
+    // getting the identifier, nil will be returned if it was never set
+    NSString *identifier = [Bugsee getUserIdentifier];
 
-    // clearing email
-    [Bugsee clearEmail];
+    // clearing the identifier
+    [Bugsee clearUserIdentifier];
 ```
 
 **Swift**
 ```swift
-    // setting email
-    Bugsee.setEmail("name@example.com")
+    // setting the identifier
+    Bugsee.setUserIdentifier("name@example.com")
 
-    // getting email, nil will be returned if email was never set
-    var email = Bugsee.getEmail();
+    // getting the identifier, nil will be returned if it was never set
+    let identifier = Bugsee.getUserIdentifier()
 
-    // clearing email
-    Bugsee.clearEmail();
+    // clearing the identifier
+    Bugsee.clearUserIdentifier()
 ```
+
+## Crash Report Extension (iOS 27+)
+
+Some terminations end an app before any in-process crash handler can run: the launch
+watchdog (`0x8badf00d`) and the memory limit (jetsam). Starting with iOS 27, the system
+hands the dead process to a Crash Reporter Extension embedded in the app. With Bugsee's
+extension, these reports carry the stack of every thread at the moment of death.
+
+Nothing changes below iOS 27, without the extension, or when the system evicts a
+suspended app (the extension is not called for that). The app keeps its own deployment
+target: only the extension target needs iOS 27. You need Xcode 27 to add it.
+
+**1. Add the extension target**
+
+In Xcode, choose File › New › Target › iOS › **Crash Reporter Extension**. Xcode embeds
+it in the app.
+
+An app can have only one crash-reporter extension. With two, the system runs one of them
+for each crash, and each misses some crashes. Do not add Bugsee's next to another
+crash-reporter extension.
+
+**2. Link `BugseeCrashExtension`**
+
+In the extension target's General tab, under Frameworks and Libraries, add the
+`BugseeCrashExtension` product of the Bugsee package. Add it to the extension target
+only. The app target keeps `Bugsee`.
+
+If the template added `CrashReportExtension.framework` to the same list, remove it. The
+iOS Simulator SDK has no such framework, so an explicit link breaks the app's simulator
+builds. On a device, the framework is linked automatically.
+
+**3. Replace the template's code**
+
+The whole extension is one declaration:
+
+```swift
+import BugseeCrashExtension
+
+@main struct CrashReport: BugseeCrashReporterExtension {}
+```
+
+Do not implement `processCrashReport(process:)`: Bugsee's implementation does the work.
+The same file builds for the simulator, where the extension does nothing.
+
+**4. Share an App Group**
+
+The extension saves what it finds in an App Group container, and the SDK reads it on the
+app's next launch. The group goes in three places:
+
+1. The app target: Signing & Capabilities › + Capability › App Groups, then add a group,
+   for example `group.com.example.myapp`.
+2. The extension target: the same capability with the same group.
+3. The extension's Info.plist: the key `BugseeAppGroup` (String) with the group id.
+
+```xml
+<key>BugseeAppGroup</key>
+<string>group.com.example.myapp</string>
+```
+
+No SDK option or app code is needed. If the extension's Info.plist has no
+`BugseeAppGroup`, the SDK logs a warning at launch. With manual signing, register the
+group in the Apple Developer portal and add it to both App IDs.
+
+**5. Keep crash reporting on**
+
+Leave `BugseeOptionDetectAndReportCrash` and `BugseeOptionDetectAndReportExit` at their
+default (on). Signal crashes are still reported by the SDK's own crash handler; the
+extension adds the terminations that handler cannot see.
+
+**Testing**
+
+- Use a device on iOS 27. The simulator never runs the extension.
+- Launch the app from the Home Screen, not from Xcode. A crash caught by the debugger
+  reaches the extension only after you detach, and stopping the app from Xcode ends it
+  in a way no extension sees.
+- The report is sent on the app's next launch.
+- The extension logs to the Console app under the subsystem `com.bugsee.crashext`.
+- Upload the app's dSYMs as usual to symbolicate the app's frames. The extension's dSYM
+  is never needed.
+
+**App Store**
+
+App Store Connect expects the extension's version and build number
+(`CFBundleShortVersionString`, `CFBundleVersion`) to match the app's. Set
+`MARKETING_VERSION` and `CURRENT_PROJECT_VERSION` on both targets, and bump both on each
+release.
+
+**Privacy**
+
+The system runs the extension for every termination it handles, also when the app has not
+called `Bugsee.launch`, for example before the user gave consent. The extension writes a
+small JSON document into the App Group container: the exit reason, the stack addresses
+of each thread with system symbol names, and the list of loaded binaries with their paths.
+It sends nothing anywhere. The document stays on the device, in the App Group, until the
+SDK's next launch reads and deletes it; at most eight wait there, the oldest going first.
+In Debug builds, the extension also keeps a small diagnostic log there, capped at 64 KB.
+
+`Bugsee.stop` takes effect once its work has run on the main thread. A termination
+before that, such as a launch watchdog in the same `didFinishLaunching` that called
+`stop`, is still reported.
+
 ## Manual invocation
 
 ### Report view
@@ -187,21 +298,20 @@ In addition to detection of shake gesture or screenshot issue report view can be
 
 **Objective-C**
 ```objective-c
-[Bugsee showReportController];
+[Bugsee showReportDialog];
 
 // or pre-fill some fields, user will be able to modify them
-[Bugsee showReportControllerWithSummary:@"Some problem"
+[Bugsee showReportDialogWithSummary:@"Some problem"
           description:@""
           severity:BugseeSeverityMedium];
 ```
 
 **Swift**
 ```swift
-// To stop video recording use   
-Bugsee.showReportController()
+Bugsee.showReportDialog()
 
 // or pre-fill some fields, user will be able to modify them
-Bugsee.showReportController(summary: "Some problem",
+Bugsee.showReportDialog(summary: "Some problem",
     description: "",
     severity: BugseeSeverityMedium)
 ```
@@ -229,7 +339,7 @@ Bugsee.upload(summary: "Upload from code",
 ### Non-fatal errors
 
 It is possible to report non-fatal errors from code. These reports will get combined similar to crashes,
-and you will be provided with statistics and a break down by unique devices, IOS versions, etc.
+and you will be provided with statistics and a break down by unique devices, iOS versions, etc.
 
 **Objective-C**
 ```objective-c
@@ -241,18 +351,9 @@ and you will be provided with statistics and a break down by unique devices, IOS
 
 **Swift**
 ```swift
-Bugsee.logError(NSError(domain: "com.example.errors.ServerIsDown",
+Bugsee.logError(error: NSError(domain: "com.example.errors.ServerIsDown",
 						code: 10234,
 						userInfo: ["key1": "value1", "key2": "value2"]))
-```
-
-
-### Asserts
-
-You can also let Bugsee validate asserts and auto create isssues and upload them once the assert fails.
-
-```objective-c
-BUGSEE_ASSERT(balance > 0, @"Balance is wrong")
 ```
 
 
@@ -262,15 +363,15 @@ User events can be attached to the report, events are identified by a string and
 
 **Objective-C**
 ```objective-c
-	// Without any additional parameters
-    [Bugsee registerEvent:@"payment_processed"];
+    // Without any additional parameters
+    [Bugsee event:@"payment_processed"];
 
-    // ...our with additional custom parameters
-    [Bugsee registerEvent:@"payment_processed"
-               withParams:@{
-                	@"amount": @125,
-                	@"currency": 'USD'
-    	         }];
+    // ...or with additional custom parameters
+    [Bugsee event:@"payment_processed"
+           params:@{
+               @"amount": @125,
+               @"currency": @"USD"
+           }];
 ```
 
 **Swift**
@@ -278,7 +379,7 @@ User events can be attached to the report, events are identified by a string and
     // Without any additional parameters
     Bugsee.event("payment_processed")
 
-    // ...our with additional custom parameters
+    // ...or with additional custom parameters
     Bugsee.event("payment_processed",
       params:["amount": 125, "currency": "USD"])
 ```
@@ -287,20 +388,20 @@ User events can be attached to the report, events are identified by a string and
 
 User traces can be attached to the report, this may be useful when you want to trace how a specific variable or state changes over time right before the problem happens.
 
-There are two ways available to trace a property, manually setting a value or automatically setting an observer on a property of an object.
+Set the trace's value every time it changes.
 
 **Objective-C**
 ```objective-c
-    // Manually set value of @15 to property named "credit_balance"
+    // Set value of @15 to the trace named "credit_balance"
     // any time it changes
-    [Bugsee traceKey:@"credit_balance" withVaue:@15];  
+    [Bugsee trace:@"credit_balance" value:@15];
 ```
 
 **Swift**
 ```swift
-    // Manually set value of @15 to property named "credit_balance"
+    // Set value of 15 to the trace named "credit_balance"
     // any time it changes
-    Bugsee.trace(key:"credit_balance", value:15)
+    Bugsee.trace("credit_balance", value: 15)
 ```
 
 
